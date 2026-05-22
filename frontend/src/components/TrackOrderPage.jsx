@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { 
-  Package, MapPin, CheckCircle2, Clock, Loader2, IndianRupee, 
+import {
+  Package, MapPin, CheckCircle2, Clock, Loader2, IndianRupee,
   ArrowLeft, Phone, Navigation, Home, Bike, AlertCircle,
   Star, ChevronRight, User, Search, ArrowRight, ShoppingBag,
   UtensilsCrossed, PackageCheck, HandHelping, Flag
@@ -9,7 +9,7 @@ import {
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { normalizeStatus, STATUS_STEPS, compareStatus, getEtaCountdownText } from '../services/statusService';
+import { normalizeStatus, STATUS_STEPS, STATUS_PRIORITY, compareStatus, getEtaCountdownText } from '../services/statusService';
 import { useAuth } from '../hooks/useAuth';
 import { getRoute } from '../services/mapService';
 import apiClient from '../services/apiClient';
@@ -21,10 +21,10 @@ import iconUrl from 'leaflet/dist/images/marker-icon.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
 
 let DefaultIcon = L.icon({
-    iconUrl: iconUrl,
-    shadowUrl: iconShadow,
-    iconSize: [25, 41],
-    iconAnchor: [12, 41]
+  iconUrl: iconUrl,
+  shadowUrl: iconShadow,
+  iconSize: [25, 41],
+  iconAnchor: [12, 41]
 });
 
 L.Marker.prototype.options.icon = DefaultIcon;
@@ -45,19 +45,151 @@ const destinationIcon = L.divIcon({
   iconAnchor: [14, 14],
 });
 
-const ROUTE_FROM_RIDER_STATUSES = new Set(['ACCEPTED', 'ORDER_PICKED_UP', 'OUT_FOR_DELIVERY']);
+const ROUTE_FROM_RIDER_STATUSES = new Set([
+  'ASSIGNED',
+  'ACCEPTED',
+  'ORDER_PICKED_UP',
+  'OUT_FOR_DELIVERY',
+  'NEAR_CUSTOMER_LOCATION',
+]);
+
+/** Read rider lat/lng — prefer order snapshot (WS/API), then live driver state. */
+function readRiderCoords(order, driverLocation) {
+  const rl = order?.rider_location;
+  const r = order?.rider;
+  const lat = parseFloat(
+    rl?.latitude ?? rl?.lat ?? r?.lat ?? driverLocation?.lat
+  );
+  const lng = parseFloat(
+    rl?.longitude ?? rl?.lng ?? r?.lng ?? driverLocation?.lng
+  );
+  return isValidLatLngPair(lat, lng) ? { lat, lng } : null;
+}
 
 function isValidLatLngPair(lat, lng) {
-  if (lat == null || lng == null) return false;
+  if (lat === null || lat === undefined || lng === null || lng === undefined) return false;
   const la = Number(lat);
   const ln = Number(lng);
   if (!Number.isFinite(la) || !Number.isFinite(ln)) return false;
   return la >= -90 && la <= 90 && ln >= -180 && ln <= 180;
 }
 
-// Helper: fit map to route or point(s); re-runs when route/points change (live rider updates).
-function FitBounds({ route, points, orderId }) {
+function coordRejectionReason(rawLat, rawLng, parsedLat, parsedLng) {
+  if (rawLat === undefined && rawLng === undefined) return 'missing';
+  if (rawLat === null || rawLng === null) return 'null';
+  if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLng)) return 'nan';
+  if (parsedLat < -90 || parsedLat > 90 || parsedLng < -180 || parsedLng > 180) return 'out_of_bounds';
+  return 'unknown';
+}
+
+/**
+ * Resolve customer destination from order payload (priority order preserved).
+ * Accepts numeric strings; rejects only null/undefined/NaN/out-of-bounds.
+ */
+function resolveDeliveryCoords(order) {
+  if (!order) return null;
+
+  const candidates = [
+    {
+      source: 'delivery_location',
+      lat: order?.delivery_location?.latitude,
+      lng: order?.delivery_location?.longitude,
+    },
+    {
+      source: 'delivery_location.lat',
+      lat: order?.delivery_location?.lat,
+      lng: order?.delivery_location?.lng,
+    },
+    {
+      source: 'locations.user',
+      lat: order?.locations?.user?.lat,
+      lng: order?.locations?.user?.lng,
+    },
+    {
+      source: 'user_lat',
+      lat: order?.user_lat,
+      lng: order?.user_lng,
+    },
+    {
+      source: 'address',
+      lat: order?.address?.latitude,
+      lng: order?.address?.longitude,
+    },
+    {
+      source: 'delivery_address',
+      lat: order?.delivery_address?.latitude,
+      lng: order?.delivery_address?.longitude,
+    },
+    {
+      source: 'user_address',
+      lat: order?.user_address?.latitude,
+      lng: order?.user_address?.longitude,
+    },
+  ];
+
+  const rejections = [];
+  for (const { source, lat, lng } of candidates) {
+    if (lat === undefined && lng === undefined) continue;
+    const parsedLat = parseFloat(lat);
+    const parsedLng = parseFloat(lng);
+    if (isValidLatLngPair(parsedLat, parsedLng)) {
+      return { lat: parsedLat, lng: parsedLng, source };
+    }
+    rejections.push({
+      source,
+      raw: { lat, lng },
+      reason: coordRejectionReason(lat, lng, parsedLat, parsedLng),
+    });
+  }
+  return { rejections };
+}
+
+/** Keep valid delivery snapshot coords when WS/API payloads omit them. */
+function mergeOrderPreserveDeliveryCoords(prev, incoming) {
+  if (!incoming) return incoming ?? prev;
+  const readDelivery = (o) => {
+    const resolved = resolveDeliveryCoords(o);
+    return resolved?.lat != null ? { lat: resolved.lat, lng: resolved.lng } : null;
+  };
+  const inc = readDelivery(incoming);
+  if (inc) return incoming;
+  const kept = readDelivery(prev);
+  if (!kept) return incoming;
+  return {
+    ...incoming,
+    user_lat: kept.lat,
+    user_lng: kept.lng,
+    delivery_location: {
+      ...(incoming.delivery_location || {}),
+      latitude: kept.lat,
+      longitude: kept.lng,
+      lat: kept.lat,
+      lng: kept.lng,
+    },
+    address: {
+      ...(incoming.address || {}),
+      latitude: kept.lat,
+      longitude: kept.lng,
+    },
+    locations: {
+      ...(incoming.locations || {}),
+      user: {
+        ...(incoming.locations?.user || {}),
+        lat: kept.lat,
+        lng: kept.lng,
+      },
+    },
+  };
+}
+
+// Helper: fit map when destination/rider/route context changes — not on every live rider tick.
+function FitBounds({ route, points, orderId, fitKey }) {
   const map = useMap();
+  const lastFitKeyRef = useRef('');
+
+  useEffect(() => {
+    lastFitKeyRef.current = '';
+  }, [orderId]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -67,12 +199,17 @@ function FitBounds({ route, points, orderId }) {
   }, [map, orderId]);
 
   useEffect(() => {
+    if (!fitKey || lastFitKeyRef.current === fitKey) return;
+    lastFitKeyRef.current = fitKey;
+
     if (route && route.length > 1) {
-      map.fitBounds(L.latLngBounds(route), { padding: [50, 50] });
-    } else if (points && points.length > 0) {
-      map.fitBounds(L.latLngBounds(points), { padding: [50, 50] });
+      map.fitBounds(L.latLngBounds(route), { padding: [50, 50], maxZoom: 16 });
+    } else if (points && points.length > 1) {
+      map.fitBounds(L.latLngBounds(points), { padding: [50, 50], maxZoom: 16 });
+    } else if (points && points.length === 1) {
+      map.setView(points[0], 15);
     }
-  }, [route, points, map, orderId]);
+  }, [fitKey, route, points, map]);
 
   return null;
 }
@@ -84,7 +221,7 @@ const TrackOrderPage = () => {
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  
+
   const [driverLocation, setDriverLocation] = useState(null);
   const [interpolatedDriverPos, setInterpolatedDriverPos] = useState(null);
   const [status, setStatus] = useState("ORDER_PLACED");
@@ -96,7 +233,7 @@ const TrackOrderPage = () => {
   const [driverBearing, setDriverBearing] = useState(0);
   const [activeRiderId, setActiveRiderId] = useState(null);
   const [isOffline, setIsOffline] = useState(false);
-  
+
   const [searchInput, setSearchInput] = useState('');
   // Refs (Phase 3 Hardening)
   const socketRef = useRef(null);
@@ -120,6 +257,8 @@ const TrackOrderPage = () => {
   const intentionalCloseRef = useRef(false);
   const orderSnapshotRef = useRef(null);
   const invalidDeliveryCoordWarnedRef = useRef(false);
+  const lastDestLogKeyRef = useRef('');
+  const lastRouteLogKeyRef = useRef('');
 
   useEffect(() => {
     orderSnapshotRef.current = order;
@@ -128,6 +267,8 @@ const TrackOrderPage = () => {
   // Reset state on orderId change
   useEffect(() => {
     invalidDeliveryCoordWarnedRef.current = false;
+    lastDestLogKeyRef.current = '';
+    lastRouteLogKeyRef.current = '';
     lastUpdateRef.current = 0;
     lastPayloadRef.current = "";
     previousPosRef.current = null;
@@ -143,17 +284,17 @@ const TrackOrderPage = () => {
     let animId;
     const animate = (time) => {
       const { startPos, endPos, startTime, duration } = interpolationRef.current;
-      
+
       if (startPos && endPos && startTime > 0) {
         const elapsed = time - startTime;
         const t = Math.min(elapsed / duration, 1);
-        
+
         const easeOut = (x) => 1 - Math.pow(1 - x, 3);
         const smoothT = easeOut(t);
-        
+
         const currentLat = startPos.lat + (endPos.lat - startPos.lat) * smoothT;
         const currentLng = startPos.lng + (endPos.lng - startPos.lng) * smoothT;
-        
+
         if (previousPosRef.current) {
           const dy = currentLat - previousPosRef.current.lat;
           const dx = currentLng - previousPosRef.current.lng;
@@ -165,7 +306,7 @@ const TrackOrderPage = () => {
         previousPosRef.current = { lat: currentLat, lng: currentLng };
 
         setInterpolatedDriverPos({ lat: currentLat, lng: currentLng });
-        
+
         if (t < 1) {
           animId = requestAnimationFrame(animate);
         }
@@ -173,7 +314,7 @@ const TrackOrderPage = () => {
         setInterpolatedDriverPos(endPos);
       }
     };
-    
+
     animId = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(animId);
   }, []);
@@ -184,11 +325,11 @@ const TrackOrderPage = () => {
    */
   const syncOrderState = (data, source = "POLLING") => {
     if (!data) return;
-    
+
     const statusObj = data.status_full || data.status;
     const incomingStatus = statusObj?.current_status || statusObj;
     const incomingTimestamp = statusObj?.last_updated ? new Date(statusObj.last_updated).getTime() : Date.now();
-    
+
     // 1. DEDUPLICATION
     const payloadKey = JSON.stringify({
       s: incomingStatus,
@@ -214,37 +355,25 @@ const TrackOrderPage = () => {
     const isHigherPriority = compareStatus(incomingStatus, status) > 0;
     const isSamePriority = compareStatus(incomingStatus, status) === 0;
 
+    // Rider GPS always applied when present (independent of status/version gate)
+    const riderCoords = readRiderCoords(data, null);
+    if (riderCoords) {
+      const newPos = riderCoords;
+      interpolationRef.current = {
+        startPos: interpolatedDriverPos || newPos,
+        endPos: newPos,
+        startTime: performance.now(),
+        duration: 2000
+      };
+      setDriverLocation(newPos);
+    }
+
     if (!order || incomingVersion > currentVersion || isHigherPriority || (isSamePriority && isNewer)) {
       lastUpdateRef.current = incomingTimestamp;
       const normalized = normalizeStatus(statusObj);
-      
+
       setStatus(normalized);
 
-      // Rider live location (API + websocket normalized payloads)
-      const rawLat =
-        data.rider_location?.latitude ??
-        data.rider?.lat ??
-        data.driver_lat ??
-        data.locations?.driver?.lat;
-      const rawLng =
-        data.rider_location?.longitude ??
-        data.rider?.lng ??
-        data.driver_lng ??
-        data.locations?.driver?.lng;
-      const lat = rawLat != null ? parseFloat(rawLat) : null;
-      const lng = rawLng != null ? parseFloat(rawLng) : null;
-
-      if (isValidLatLngPair(lat, lng)) {
-        const newPos = { lat, lng };
-        interpolationRef.current = {
-          startPos: interpolatedDriverPos || newPos,
-          endPos: newPos,
-          startTime: performance.now(),
-          duration: 2000 
-        };
-        setDriverLocation(newPos);
-      }
-      
       if (data.activeRiderId || data.rider?.riderId) {
         setActiveRiderId(data.activeRiderId || data.rider.riderId);
       }
@@ -257,7 +386,7 @@ const TrackOrderPage = () => {
         const newPayStatus = data.payment_status || data.status_full?.payment_status;
         setOrder(prev => prev ? { ...prev, payment_status: newPayStatus } : prev);
       }
-      
+
       setLastUpdate(new Date());
     } else {
       console.warn(`[SYNC] Blocking stale update or regression: ${status} (${lastUpdateRef.current}) -> ${incomingStatus} (${incomingTimestamp})`);
@@ -286,7 +415,7 @@ const TrackOrderPage = () => {
         setConnectionStatus('offline');
         return;
       }
-      
+
       // 2. Strict Socket Dedup
       if (socketRef.current && (socketRef.current.readyState === WebSocket.OPEN || socketRef.current.readyState === WebSocket.CONNECTING)) {
         return;
@@ -299,7 +428,7 @@ const TrackOrderPage = () => {
 
       console.log(`[WS][CONNECTING] order=${orderId}`);
       setConnectionStatus('connecting');
-      
+
       // Use localStorage directly for the most current token state
       const token = localStorage.getItem("customerToken");
       const socket = new WebSocket(`${WS_BASE_URL}/ws/track/${orderId}?token=${token}`);
@@ -313,7 +442,7 @@ const TrackOrderPage = () => {
         heartbeatInterval = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.send("ping");
         }, 15000);
-        fetchOrderDetails(); 
+        fetchOrderDetails();
       };
 
       socket.onmessage = (event) => {
@@ -340,8 +469,9 @@ const TrackOrderPage = () => {
               newLng != null &&
               (Number(newLat) !== Number(oldLat) || Number(newLng) !== Number(oldLng));
             if (incomingVersion <= currentVersion && !riderMoved) return;
-            setOrder(fullOrder);
-            syncOrderState(fullOrder, "WS");
+            const mergedOrder = mergeOrderPreserveDeliveryCoords(prev, fullOrder);
+            setOrder(mergedOrder);
+            syncOrderState(mergedOrder, "WS");
           } else if (data.event === 'RIDER_STATUS_UPDATE') {
             const riderId = data.rider_id;
             const incomingVersion = data.version || 0;
@@ -405,7 +535,7 @@ const TrackOrderPage = () => {
           console.warn(`[WS][AUTH_FAILED] code=${event.code} — halting reconnect loop`);
           intentionalCloseRef.current = true;
           setConnectionStatus('error');
-          
+
           if (event.code === 4001) {
             setError('Session expired. Please login again.');
             // Clear expired token to prevent immediate loop on reload
@@ -426,7 +556,7 @@ const TrackOrderPage = () => {
         setConnectionStatus('reconnecting');
         const delay = Math.min(Math.pow(2, reconnectAttemptRef.current) * 1000, 15000);
         clearTimeout(reconnectTimeoutRef.current);
-        console.log(`[WS][RECONNECT_ATTEMPT] ${reconnectAttemptRef.current + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay/1000)}s`);
+        console.log(`[WS][RECONNECT_ATTEMPT] ${reconnectAttemptRef.current + 1}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s`);
         reconnectTimeoutRef.current = setTimeout(() => {
           reconnectAttemptRef.current++;
           connect();
@@ -458,7 +588,7 @@ const TrackOrderPage = () => {
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     connect();
-    
+
     return () => {
       cleanupCalled = true;
       intentionalCloseRef.current = true;
@@ -479,7 +609,7 @@ const TrackOrderPage = () => {
     // IMPORTANT: Do NOT check `loading` here — this function is what clears loading.
     // Checking `loading` caused a deadlock: loading===true → bail → setLoading never called.
     if (!customerToken || !orderId || orderId === 'undefined' || isPollingRef.current) return;
-    
+
     // 1. Hydration Guard — with fallback retry for first-render timing edge case
     if (localStorage.getItem("auth_hydrated") !== "true") {
       // Auth context may not have fired its useEffect yet; retry after a short delay
@@ -499,8 +629,9 @@ const TrackOrderPage = () => {
       // Backend returns the order object directly (no success wrapper on this endpoint)
       const data = response?.success ? response.data : response;
       if (data && data.order_id) {
-        setOrder(data);
-        syncOrderState(data, "POLLING");
+        const merged = mergeOrderPreserveDeliveryCoords(orderSnapshotRef.current, data);
+        setOrder(merged);
+        syncOrderState(merged, "POLLING");
       }
     } catch (err) {
       if (err?.silent) {
@@ -540,29 +671,41 @@ const TrackOrderPage = () => {
     navigate(`/track-order/${searchInput.trim()}`);
   };
 
-  /** Delivery destination from order snapshot — validated range; no silent fallbacks. */
+  /** Delivery destination — multi-source resolution with defensive parseFloat. */
   const validatedDeliveryCoords = useMemo(() => {
-    const dl = order?.delivery_location;
-    let lat = dl?.latitude ?? order?.locations?.user?.lat;
-    let lng = dl?.longitude ?? order?.locations?.user?.lng;
-    lat = parseFloat(lat);
-    lng = parseFloat(lng);
-    if (!isValidLatLngPair(lat, lng)) {
+    const resolved = resolveDeliveryCoords(order);
+    if (!resolved || resolved.rejections) {
       if (order?.order_id && !invalidDeliveryCoordWarnedRef.current) {
-        console.warn('[TrackOrder] Missing or invalid delivery coordinates; destination marker hidden.');
+        const rejected = resolved?.rejections || [];
+        rejected.forEach(({ source, reason }) => {
+          console.warn('[TrackOrder][DEST] invalid source rejected', { source, reason });
+        });
+        if (!rejected.length) {
+          console.warn('[TrackOrder][DEST] invalid source rejected', { source: 'none', reason: 'missing' });
+        }
         invalidDeliveryCoordWarnedRef.current = true;
       }
       return null;
     }
+    const { lat, lng, source } = resolved;
+    const destKey = `${order?.order_id}:${lat},${lng}`;
+    if (lastDestLogKeyRef.current !== destKey) {
+      lastDestLogKeyRef.current = destKey;
+      console.log('[TrackOrder][DEST] selected coordinates', { lat, lng, source });
+    }
     return { lat, lng };
   }, [order]);
 
-  const showRiderToCustomerRoute = useMemo(
-    () => ROUTE_FROM_RIDER_STATUSES.has(normalizeStatus(status)),
-    [status]
-  );
+  const showRiderToCustomerRoute = useMemo(() => {
+    const s = normalizeStatus(status);
+    if (s === 'DELIVERED' || s === 'CANCELLED') return false;
+    if (ROUTE_FROM_RIDER_STATUSES.has(s)) return true;
+    const riderCoords = readRiderCoords(order, driverLocation);
+    if (!riderCoords || isOffline) return false;
+    return (STATUS_PRIORITY[s] ?? 0) >= STATUS_PRIORITY.ASSIGNED;
+  }, [status, isOffline, order, driverLocation]);
 
-  /** Route start: live rider position only during active delivery leg (after acceptance). */
+  /** Route start: live rider position during active delivery (interpolated WS updates). */
   const riderRouteStart = useMemo(() => {
     if (!showRiderToCustomerRoute) return null;
     if (
@@ -571,19 +714,41 @@ const TrackOrderPage = () => {
     ) {
       return interpolatedDriverPos;
     }
-    const rl = order?.rider_location;
-    const r = order?.rider;
-    const lat = parseFloat(rl?.latitude ?? r?.lat);
-    const lng = parseFloat(rl?.longitude ?? r?.lng);
-    if (isValidLatLngPair(lat, lng)) return { lat, lng };
-    return null;
-  }, [showRiderToCustomerRoute, interpolatedDriverPos, order?.rider, order?.rider_location]);
+    if (driverLocation && isValidLatLngPair(driverLocation.lat, driverLocation.lng)) {
+      return driverLocation;
+    }
+    return readRiderCoords(order, null);
+  }, [showRiderToCustomerRoute, interpolatedDriverPos, driverLocation, order?.rider, order?.rider_location]);
+
+  /** Throttled origin for OSRM — avoids refetch on every animation frame. */
+  const routeFetchOriginKey = useMemo(() => {
+    if (!showRiderToCustomerRoute || !validatedDeliveryCoords) return null;
+    const pos = readRiderCoords(order, driverLocation);
+    if (!pos) return null;
+    const snapLat = Math.round(pos.lat * 1000) / 1000;
+    const snapLng = Math.round(pos.lng * 1000) / 1000;
+    return `${snapLat},${snapLng}`;
+  }, [showRiderToCustomerRoute, validatedDeliveryCoords, driverLocation, order?.rider, order?.rider_location]);
+
+  /** Polyline shown on map: road route when available, straight line fallback, live rider anchor. */
+  const displayRoute = useMemo(() => {
+    if (!showRiderToCustomerRoute || !validatedDeliveryCoords || !riderRouteStart) return [];
+    const dest = [validatedDeliveryCoords.lat, validatedDeliveryCoords.lng];
+    const liveStart = [riderRouteStart.lat, riderRouteStart.lng];
+    if (route.length > 1) {
+      const pts = route.map(([la, ln]) => [la, ln]);
+      pts[0] = liveStart;
+      pts[pts.length - 1] = dest;
+      return pts;
+    }
+    return [liveStart, dest];
+  }, [route, riderRouteStart, validatedDeliveryCoords, showRiderToCustomerRoute]);
 
   const showRiderMarker = Boolean(
     showRiderToCustomerRoute &&
-      riderRouteStart &&
-      Number.isFinite(riderRouteStart.lat) &&
-      Number.isFinite(riderRouteStart.lng)
+    riderRouteStart &&
+    Number.isFinite(riderRouteStart.lat) &&
+    Number.isFinite(riderRouteStart.lng)
   );
 
   const fitBoundsPoints = useMemo(() => {
@@ -595,21 +760,45 @@ const TrackOrderPage = () => {
     return pts;
   }, [validatedDeliveryCoords, showRiderMarker, riderRouteStart]);
 
+  const mapFitKey = useMemo(() => {
+    if (!validatedDeliveryCoords || !order?.order_id) return '';
+    const dest = `${validatedDeliveryCoords.lat},${validatedDeliveryCoords.lng}`;
+    const riderKey = showRiderMarker ? 'with-rider' : 'destination-only';
+    const routeKey = displayRoute.length > 1 ? 'with-route' : 'no-route';
+    return `${order.order_id}:${dest}:${riderKey}:${routeKey}`;
+  }, [order?.order_id, validatedDeliveryCoords, showRiderMarker, displayRoute.length]);
+
+  useEffect(() => {
+    if (!showRiderToCustomerRoute || !validatedDeliveryCoords || !routeFetchOriginKey) return;
+    const routeKey = `${order?.order_id}:${routeFetchOriginKey}:${validatedDeliveryCoords.lat},${validatedDeliveryCoords.lng}`;
+    if (lastRouteLogKeyRef.current === routeKey) return;
+    lastRouteLogKeyRef.current = routeKey;
+    const [latStr, lngStr] = routeFetchOriginKey.split(',');
+    console.log('[TrackOrder][ROUTE] rider + destination route triggered', {
+      rider: { lat: parseFloat(latStr), lng: parseFloat(lngStr) },
+      destination: validatedDeliveryCoords,
+    });
+  }, [showRiderToCustomerRoute, validatedDeliveryCoords, routeFetchOriginKey, order?.order_id]);
+
   useEffect(() => {
     let cancelled = false;
     const loadRoute = async () => {
-      if (!validatedDeliveryCoords || !riderRouteStart || !showRiderToCustomerRoute) {
+      if (!validatedDeliveryCoords || !routeFetchOriginKey || !showRiderToCustomerRoute) {
         setRoute([]);
         return;
       }
+      const [latStr, lngStr] = routeFetchOriginKey.split(',');
+      const origin = { lat: parseFloat(latStr), lng: parseFloat(lngStr) };
       try {
-        const routeData = await getRoute(
-          { lat: riderRouteStart.lat, lng: riderRouteStart.lng },
-          { lat: validatedDeliveryCoords.lat, lng: validatedDeliveryCoords.lng }
-        );
-        if (!cancelled) setRoute(Array.isArray(routeData) ? routeData : []);
+        const routeData = await getRoute(origin, {
+          lat: validatedDeliveryCoords.lat,
+          lng: validatedDeliveryCoords.lng,
+        });
+        if (!cancelled) {
+          setRoute(Array.isArray(routeData) ? routeData : []);
+        }
       } catch (err) {
-        console.error("Route loading failed:", err);
+        console.error('[TrackOrder][ROUTE] loading failed:', err);
         if (!cancelled) setRoute([]);
       }
     };
@@ -617,23 +806,23 @@ const TrackOrderPage = () => {
     return () => {
       cancelled = true;
     };
-  }, [validatedDeliveryCoords, riderRouteStart, showRiderToCustomerRoute]);
+  }, [validatedDeliveryCoords, routeFetchOriginKey, showRiderToCustomerRoute]);
 
   // Rule 11: Memoize derived timeline calculations to prevent unnecessary re-renders
   const statusStepsWithIcons = useMemo(() => [
-    { id: 'ORDER_PLACED',           label: 'Placed',    icon: ShoppingBag },
-    { id: 'RESTAURANT_CONFIRMED',   label: 'Confirmed', icon: CheckCircle2 },
-    { id: 'FOOD_READY',             label: 'Ready',     icon: PackageCheck },
-    { id: 'ASSIGNED',               label: 'Assigned',  icon: Bike },
-    { id: 'ORDER_PICKED_UP',        label: 'Picked Up', icon: HandHelping },
-    { id: 'OUT_FOR_DELIVERY',       label: 'On Way',    icon: Bike },
-    { id: 'NEAR_CUSTOMER_LOCATION', label: 'Arriving',  icon: MapPin },
-    { id: 'DELIVERED',              label: 'Delivered', icon: Flag }
+    { id: 'ORDER_PLACED', label: 'Placed', icon: ShoppingBag },
+    { id: 'RESTAURANT_CONFIRMED', label: 'Confirmed', icon: CheckCircle2 },
+    { id: 'FOOD_READY', label: 'Ready', icon: PackageCheck },
+    { id: 'ASSIGNED', label: 'Assigned', icon: Bike },
+    { id: 'ORDER_PICKED_UP', label: 'Picked Up', icon: HandHelping },
+    { id: 'OUT_FOR_DELIVERY', label: 'On Way', icon: Bike },
+    { id: 'NEAR_CUSTOMER_LOCATION', label: 'Arriving', icon: MapPin },
+    { id: 'DELIVERED', label: 'Delivered', icon: Flag }
   ], []);
 
-  const currentStepIndex = useMemo(() => 
+  const currentStepIndex = useMemo(() =>
     statusStepsWithIcons.findIndex(s => s.id === status),
-  [status, statusStepsWithIcons]);
+    [status, statusStepsWithIcons]);
 
   const center = useMemo(() => {
     if (validatedDeliveryCoords) return [validatedDeliveryCoords.lat, validatedDeliveryCoords.lng];
@@ -660,10 +849,10 @@ const TrackOrderPage = () => {
         <div className="w-24 h-24 bg-orange-50 rounded-full flex items-center justify-center mb-8">
           <Search className="w-10 h-10 text-[#ff6b00]" />
         </div>
-        
+
         <h2 className="text-3xl font-black text-gray-900 mb-2 tracking-tight">Track Your Order</h2>
         <p className="text-gray-500 mb-10 max-w-sm mx-auto font-medium">Enter your order ID below to see live updates and delivery progress.</p>
-        
+
         <form onSubmit={handleSearch} className="w-full max-w-md space-y-4">
           <div className="relative group">
             <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
@@ -677,7 +866,7 @@ const TrackOrderPage = () => {
               className="block w-full pl-12 pr-4 py-5 bg-white border-2 border-gray-100 rounded-2xl text-base font-bold placeholder-gray-400 focus:outline-none focus:border-[#ff6b00] focus:ring-4 focus:ring-orange-50 transition-all shadow-sm"
             />
           </div>
-          
+
           {error && (
             <div className="flex items-center gap-2 text-red-500 text-sm font-bold bg-red-50 p-4 rounded-xl border border-red-100">
               <AlertCircle className="w-4 h-4" />
@@ -685,7 +874,7 @@ const TrackOrderPage = () => {
             </div>
           )}
 
-          <button 
+          <button
             type="submit"
             disabled={!searchInput.trim()}
             className="w-full py-5 bg-gray-900 text-white rounded-2xl font-black hover:bg-[#ff6b00] transition-all transform hover:scale-[1.02] active:scale-[0.98] shadow-lg shadow-gray-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-gray-900 flex items-center justify-center gap-3"
@@ -695,7 +884,7 @@ const TrackOrderPage = () => {
           </button>
         </form>
 
-        <button 
+        <button
           onClick={() => navigate('/menu')}
           className="mt-8 text-sm font-bold text-gray-500 hover:text-gray-900 transition-colors flex items-center gap-2"
         >
@@ -711,10 +900,10 @@ const TrackOrderPage = () => {
   return (
     <div className="min-h-screen bg-[#FDFDFD] pt-24 sm:pt-32 pb-16 overflow-x-hidden">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        
+
         <div className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4">
           <div className="flex items-center gap-4">
-            <button 
+            <button
               onClick={() => navigate('/orders')}
               className="p-3 bg-white border border-gray-100 rounded-xl text-gray-500 hover:text-[#ff6b00] hover:border-orange-100 transition-all shadow-sm group"
             >
@@ -736,15 +925,14 @@ const TrackOrderPage = () => {
           <div className="flex flex-col items-end gap-1.5">
             <div className="flex items-center gap-3 bg-white px-4 py-2 rounded-xl border border-gray-100 shadow-sm">
               <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${
-                  connectionStatus === 'connected' ? 'bg-green-500 animate-pulse' : 
-                  connectionStatus === 'reconnecting' ? 'bg-amber-500 animate-pulse' : 
-                  'bg-red-500'
-                }`} />
+                <div className={`w-2 h-2 rounded-full ${connectionStatus === 'connected' ? 'bg-green-500 animate-pulse' :
+                  connectionStatus === 'reconnecting' ? 'bg-amber-500 animate-pulse' :
+                    'bg-red-500'
+                  }`} />
                 <span className="text-[10px] font-black text-gray-900 uppercase tracking-widest">
-                  {connectionStatus === 'connected' ? 'Live Updates' : 
-                   connectionStatus === 'reconnecting' ? 'Reconnecting...' : 
-                   'Offline'}
+                  {connectionStatus === 'connected' ? 'Live Updates' :
+                    connectionStatus === 'reconnecting' ? 'Reconnecting...' :
+                      'Offline'}
                 </span>
               </div>
             </div>
@@ -757,12 +945,17 @@ const TrackOrderPage = () => {
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           <div className="lg:col-span-8 space-y-6 min-w-0">
             <div className="bg-white rounded-2xl shadow-xl shadow-gray-200/50 border border-gray-100 overflow-hidden relative w-full z-0" style={{ height: '450px' }}>
-                {validatedDeliveryCoords ? (
-                <MapContainer 
-                  center={center} 
-                  zoom={mapZoom} 
+              {validatedDeliveryCoords ? (
+                <MapContainer
+                  center={center}
+                  zoom={mapZoom}
                   style={{ width: '100%', height: '100%' }}
                   zoomControl={false}
+                  scrollWheelZoom
+                  dragging
+                  touchZoom
+                  doubleClickZoom
+                  boxZoom
                 >
                   <TileLayer
                     url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -781,29 +974,34 @@ const TrackOrderPage = () => {
                     />
                   )}
 
-                  {route.length > 0 && showRiderToCustomerRoute && (
-                    <Polyline 
-                      positions={route} 
-                      color="#ff6b00" 
-                      weight={5} 
+                  {displayRoute.length > 1 && showRiderToCustomerRoute && (
+                    <Polyline
+                      positions={displayRoute}
+                      color="#ff6b00"
+                      weight={5}
                       opacity={0.8}
                       lineCap="round"
                     />
                   )}
 
-                  <FitBounds route={route} points={fitBoundsPoints} orderId={order?.order_id} />
+                  <FitBounds
+                    route={displayRoute.length > 1 ? displayRoute : null}
+                    points={fitBoundsPoints}
+                    orderId={order?.order_id}
+                    fitKey={mapFitKey}
+                  />
                 </MapContainer>
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center bg-gray-50 px-6 text-center">
-                    <AlertCircle className="w-12 h-12 text-amber-500 mb-3" />
-                    <p className="text-sm font-bold text-gray-700 max-w-md">
-                      Delivery map location is unavailable for this order (saved coordinates missing or invalid).
-                    </p>
-                    <p className="text-xs text-gray-500 mt-2 max-w-sm">
-                      Orders placed before address pinning may need a new delivery address with valid coordinates.
-                    </p>
-                  </div>
-                )}
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center bg-gray-50 px-6 text-center">
+                  <AlertCircle className="w-12 h-12 text-amber-500 mb-3" />
+                  <p className="text-sm font-bold text-gray-700 max-w-md">
+                    Delivery map location is unavailable for this order (saved coordinates missing or invalid).
+                  </p>
+                  <p className="text-xs text-gray-500 mt-2 max-w-sm">
+                    Orders placed before address pinning may need a new delivery address with valid coordinates.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="bg-white rounded-2xl p-5 sm:p-8 border border-gray-100 shadow-sm overflow-x-auto scrollbar-hide">
@@ -826,26 +1024,24 @@ const TrackOrderPage = () => {
                     // Guard: if status not yet resolved, treat index 0 as current
                     const safeIndex = currentStepIndex >= 0 ? currentStepIndex : 0;
                     const isCompleted = idx < safeIndex;
-                    const isCurrent  = idx === safeIndex;
+                    const isCurrent = idx === safeIndex;
 
                     return (
                       <div key={step.id} className="relative z-10 flex flex-col items-center text-center flex-1">
-                        <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center transition-all duration-500 mb-2 ${
-                          isCurrent
-                            ? 'bg-[#ff6b00] text-white shadow-[0_0_20px_rgba(255,107,0,0.4)] ring-4 ring-orange-100 scale-110 z-20'
-                            : isCompleted
-                              ? 'bg-[#ff6b00] text-white shadow-md shadow-orange-100'
-                              : 'bg-gray-50 text-gray-300'
-                        }`}>
+                        <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-xl flex items-center justify-center transition-all duration-500 mb-2 ${isCurrent
+                          ? 'bg-[#ff6b00] text-white shadow-[0_0_20px_rgba(255,107,0,0.4)] ring-4 ring-orange-100 scale-110 z-20'
+                          : isCompleted
+                            ? 'bg-[#ff6b00] text-white shadow-md shadow-orange-100'
+                            : 'bg-gray-50 text-gray-300'
+                          }`}>
                           <Icon className={`w-4 h-4 sm:w-5 sm:h-5 ${isCurrent ? 'animate-pulse' : ''}`} />
                         </div>
-                        <p className={`text-[8px] sm:text-[10px] font-black uppercase leading-tight max-w-[60px] sm:max-w-none mx-auto ${
-                          isCurrent
-                            ? 'text-[#ff6b00] scale-105 transition-transform duration-500'
-                            : isCompleted
-                              ? 'text-orange-600/80'
-                              : 'text-gray-300'
-                        }`}>
+                        <p className={`text-[8px] sm:text-[10px] font-black uppercase leading-tight max-w-[60px] sm:max-w-none mx-auto ${isCurrent
+                          ? 'text-[#ff6b00] scale-105 transition-transform duration-500'
+                          : isCompleted
+                            ? 'text-orange-600/80'
+                            : 'text-gray-300'
+                          }`}>
                           {step.label}
                         </p>
                         {isCurrent && (

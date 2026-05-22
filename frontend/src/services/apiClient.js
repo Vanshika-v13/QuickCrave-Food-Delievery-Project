@@ -17,7 +17,7 @@ const decodeToken = (token) => {
     const base64Url = token.split('.')[1];
     if (!base64Url) return null;
     const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function (c) {
       return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
     }).join(''));
     return JSON.parse(jsonPayload);
@@ -56,7 +56,7 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
     const url = config.url || "";
     const isPublicRoute = PUBLIC_ENDPOINTS.some(endpoint => url.startsWith(endpoint));
 
-     let tokenKey = 'customerToken';
+    let tokenKey = 'customerToken';
     let roleLabel = "CUSTOMER";
 
     // Strict Prefix Detection
@@ -70,7 +70,7 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
 
     const isHydrated = localStorage.getItem("auth_hydrated") === "true";
     let token = localStorage.getItem(tokenKey);
-    
+
     // Clean corrupted tokens
     if (token && (token === "undefined" || token === "null" || token.trim().length === 0)) {
       localStorage.removeItem(tokenKey);
@@ -87,7 +87,7 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
           console.warn(`[AUTH][${roleLabel}] Session expired. Clearing ${tokenKey}...`);
           localStorage.removeItem(tokenKey);
           localStorage.removeItem(tokenKey.replace('Token', 'User'));
-          
+
           if (!isPublicRoute && roleLabel !== "CUSTOMER") {
             let loginPath = '/login';
             if (roleLabel === "ADMIN") loginPath = '/admin/login';
@@ -95,7 +95,7 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
             window.location.href = loginPath;
           }
         }
-        
+
         if (!isPublicRoute) {
           return Promise.reject({ silent: true, detail: 'Session expired' });
         }
@@ -105,7 +105,7 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
 
       if (token) {
         config.headers.Authorization = `Bearer ${token}`;
-        
+
         // Role Permission Guard (Only for non-public routes)
         if (!isPublicRoute && decoded) {
           const roles = decoded.roles || [];
@@ -124,11 +124,11 @@ apiClient.requestInterceptorId = apiClient.interceptors.request.use(
       // Always block Admin/Rider portals if token missing
       if (roleLabel !== "CUSTOMER") {
         console.debug(`[AUTH][${roleLabel}] Blocked request: Missing ${tokenKey}`);
-        return Promise.reject({ 
+        return Promise.reject({
           silent: false,
           authRequired: true,
           portal: roleLabel.toLowerCase(),
-          detail: `Authentication required: ${roleLabel} portal` 
+          detail: `Authentication required: ${roleLabel} portal`
         });
       }
 
@@ -168,7 +168,7 @@ apiClient.responseInterceptorId = apiClient.interceptors.response.use(
     if (status === 401 || status === 403) {
       // Rule: Do NOT logout if the failed request was a login attempt itself
       const isAuthEndpoint = url.includes('/login') || url.includes('/signup') || url.includes('/register');
-      
+
       if (!isAuthEndpoint) {
         let tokenKey = 'customerToken';
         let loginPath = '/login';
@@ -182,11 +182,11 @@ apiClient.responseInterceptorId = apiClient.interceptors.response.use(
         }
 
         console.error(`[AUTH] Session expired or invalid (Status: ${status}). Clearing state and redirecting to ${loginPath}.`);
-        
+
         // Atomic cleanup
         localStorage.removeItem(tokenKey);
         localStorage.removeItem(tokenKey.replace('Token', 'User'));
-        
+
         // Force redirect to login
         if (!window.location.pathname.includes('/login')) {
           window.location.href = loginPath;

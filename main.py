@@ -28,6 +28,7 @@ import time
 import math
 from collections import defaultdict
 import redis
+import re
 import json
 import bcrypt
 import traceback
@@ -64,6 +65,8 @@ rider_gps_history = defaultdict(list)
 
 # --- Dialogflow: session cart (session_id -> {item_id: {item_id, name, quantity, price}}) ---
 inprogress_orders = defaultdict(dict)
+# Pending orders: session_id -> {"item": "food_name"} waiting for quantity confirmation
+pending_orders: dict = {}
 chatbot_session_users = {}  # session_id -> (user_id, expires_at) fallback when Redis unavailable
 CHATBOT_SESSION_TTL = 86400
 
@@ -462,6 +465,11 @@ class EcosystemSocketManager:
             order_summary = db_helper.get_order_summary(order_id) or {}
             rider_data = order_summary.get("rider")
             rider_location_flat = order_summary.get("rider_location")
+            dl_ws = order_summary.get("delivery_location") or {}
+            logger.info(
+                f"[TRACK_ORDER_WS] order_id={order_id} "
+                f"delivery_lat={dl_ws.get('latitude')} delivery_lng={dl_ws.get('longitude')}"
+            )
 
             # 3. Payload Construction (BACKWARD COMPATIBLE)
             updated_at = datetime.now(timezone.utc).isoformat()
@@ -783,29 +791,120 @@ async def admin_ws(websocket: WebSocket):
 # --- Dialogflow Webhook ---
 @app.post("/")
 async def handle_request(request: Request):
+    # =====================================================================
+    # PIPELINE STEP 1: Extract raw inputs — NO cart access, NO side effects
+    # =====================================================================
     payload = await request.json()
-    intent = payload['queryResult']['intent']['displayName']
-    parameters = payload['queryResult']['parameters']
-    output_contexts = payload['queryResult']['outputContexts']
-    session_id = generic_helper.extract_session_id(output_contexts[0]['name'])
-    session_id = session_id.removeprefix("webdemo-")
-    logger.info(f"[CHATBOT][WEBHOOK] Received session_id={session_id}")
-    logger.info(f"[CHATBOT][WEBHOOK] Intent={intent}")
-    resolved_user = get_chatbot_user_id(session_id)
-    logger.info(f"[CHATBOT][WEBHOOK] Resolved user_id={resolved_user}")
+    query_result = payload.get('queryResult', {})
+    intent = query_result.get('intent', {}).get('displayName', '')
+    parameters = query_result.get('parameters', {})
+    query_text = query_result.get('queryText', '').lower().strip()
 
+    logger.info(f"[CHATBOT][PIPELINE] STEP1 raw_intent={intent!r} query={query_text!r}")
+
+    # =====================================================================
+    # PIPELINE STEP 2: HARD INTENT OVERRIDE
+    # If the user's message contains a known menu item, FORCE add_to_order.
+    # This runs BEFORE session lookup and BEFORE any handler or cart access.
+    # NO conditions — food detected means add_to_order, period.
+    # =====================================================================
+    MENU_ITEMS = [
+        "pav bhaji", "chole bhature", "pizza", "mango lassi",
+        "masala dosa", "biryani", "vada pav", "rava dosa", "samosa"
+    ]
+    matched_food = next((item for item in MENU_ITEMS if item in query_text), None)
+
+    if matched_food:
+        prev_intent = intent
+        # UNCONDITIONAL — always override, no exceptions
+        intent = 'order.add - context: ongoing-order'
+        # Always write matched_food into parameters so add_to_order finds it
+        # (overwrite any stale Dialogflow context value)
+        parameters['food-item'] = [matched_food]
+        logger.info(
+            f"[CHATBOT][FORCE_ROUTE] Food '{matched_food}' detected in query — "
+            f"overriding intent '{prev_intent}' → add_to_order"
+        )
+
+    logger.info(f"[CHATBOT][PIPELINE] STEP2 resolved_intent={intent!r}")
+
+    # =====================================================================
+    # PIPELINE STEP 3: Session extraction — still NO cart access
+    # =====================================================================
+    output_contexts = query_result.get('outputContexts', [])
+    try:
+        session_id = generic_helper.extract_session_id(output_contexts[0]['name'])
+    except (IndexError, KeyError):
+        session_id = payload.get("session", "").split("/")[-1]
+
+    session_id = session_id.removeprefix("webdemo-")
+    logger.info(f"[CHATBOT][PIPELINE] STEP3 session_id={session_id}")
+
+    resolved_user = get_chatbot_user_id(session_id)
+    logger.info(f"[CHATBOT][PIPELINE] STEP3 resolved_user_id={resolved_user}")
+
+    # FIX: Try to auto-link BEFORE reading resolved_user so the pipeline
+    # already has the mapping when the handler calls _chatbot_require_user.
     _try_link_chatbot_session_from_request(request, payload, session_id)
 
-    intent_handler_dict = {
+    # Re-resolve after potential auto-link so handlers get the correct user
+    resolved_user = get_chatbot_user_id(session_id)
+
+    # --- MANDATORY AUTH DEBUG LOG (Requirement #5) ---
+    print("[AUTH DEBUG]", {
+        "session_id": session_id,
+        "resolved_user": resolved_user,
+        "intent": intent,
+        "query": query_text,
+    })
+    logger.info(f"[AUTH DEBUG] session={session_id} user={resolved_user} intent={intent!r}")
+
+    # =====================================================================
+    # PIPELINE STEP 3.5: Pending quantity resolution
+    # If no food item was detected in this message, but the session has an
+    # item waiting for a quantity reply, route to add_to_order to complete it.
+    # =====================================================================
+    if not matched_food:
+        pending = pending_orders.get(session_id)
+        if pending and pending.get("item"):
+            logger.info(
+                f"[CHATBOT][PENDING_QTY] Session={session_id} has pending item "
+                f"'{pending['item']}' — routing to add_to_order for quantity resolution"
+            )
+            intent = 'order.add - context: ongoing-order'
+
+    # Pass raw query_text to handler so add_to_order can detect explicit numbers
+    parameters['_query_text'] = query_text
+
+    # =====================================================================
+    # PIPELINE STEP 4: Route to ONE handler — cart logic lives ONLY inside
+    # each handler function below. Nothing after this point runs.
+    # =====================================================================
+    INTENT_HANDLER_MAP = {
         'order.add - context: ongoing-order': add_to_order,
         'order.remove - context: ongoing-order': remove_from_order,
         'order.complete - context: ongoing-order': complete_order,
         'track-order - context: ongoing-tracking': track_order,
-        'order.cancel': cancel_order_handler
+        'order.cancel': cancel_order_handler,
     }
-    if intent not in intent_handler_dict:
-        return JSONResponse(content={"fulfillmentText": "Intent not handled."})
-    handler = intent_handler_dict[intent]
+
+    handler = INTENT_HANDLER_MAP.get(intent)
+    if handler is None:
+        logger.warning(f"[CHATBOT][PIPELINE] STEP4 No handler for intent={intent!r}")
+        return JSONResponse(
+            content={
+                "fulfillmentText": (
+                    "Sorry, I didn’t understand. Please order like:\n"
+                    "1 rava dosa\n"
+                    "2 pizzas"
+                )
+            }
+        )
+
+    logger.info(f"[CHATBOT][PIPELINE] STEP4 dispatching → {handler.__name__}")
+
+    # Single dispatch point — this is the ONLY return from the webhook pipeline.
+    # No code runs after this; the handler's return value is the final response.
     if inspect.iscoroutinefunction(handler):
         return await handler(parameters, session_id)
     return handler(parameters, session_id)
@@ -820,10 +919,33 @@ async def link_chatbot_session_endpoint(
     body: ChatbotLinkSession,
     current_user: dict = Depends(get_current_user),
 ):
-    """Map Dialogflow session_id to the authenticated website user."""
+    """Map Dialogflow session_id to the authenticated website user.
+
+    FIX: If the session is already linked to ANY user, skip the write
+    (idempotent guard).  Only the FIRST call per session actually stores the
+    mapping — repeated calls from the frontend (on open/re-render) are no-ops.
+    """
     if not body.session_id or not body.session_id.strip():
         raise HTTPException(status_code=400, detail="session_id is required")
-    link_chatbot_session(body.session_id.strip(), current_user["user_id"])
+
+    sid = body.session_id.strip()
+    user_id = current_user["user_id"]
+
+    # Check whether the session is already mapped
+    existing = get_chatbot_user_id(sid)
+    if existing and existing == user_id:
+        logger.info(f"[CHATBOT][LINK-SESSION] session={sid} already linked to user={user_id} — no-op")
+        return standard_response(True, "Chatbot session already linked")
+
+    if existing and existing != user_id:
+        # Different user owns this session — refuse silently (don’t expose the
+        # old user_id to the caller, just say it’s already linked).
+        logger.warning(f"[CHATBOT][LINK-SESSION] session={sid} already linked to DIFFERENT user={existing} (caller={user_id}) — refusing overwrite")
+        return standard_response(True, "Chatbot session already linked")
+
+    # First call for this session — write once
+    link_chatbot_session(sid, user_id)
+    logger.info(f"[CHATBOT][LINK-SESSION] session={sid} linked to user={user_id}")
     return standard_response(True, "Chatbot session linked")
 
 # --- Auth Endpoints ---
@@ -1506,8 +1628,11 @@ async def place_order(request: Request, current_user: dict = Depends(get_current
         address_id = payload.get("address_id")
         cart_items = payload.get("items")
         payment_method = payload.get("payment_method", "COD")
-        
+
+        logger.info(f"[ORDER][PLACE] user_id={user_id} address_id={address_id!r} payment={payment_method} items_count={len(cart_items) if cart_items else 0}")
+
         if not address_id:
+            logger.warning(f"[ORDER][PLACE][VALIDATION] address_id is missing or falsy for user_id={user_id}")
             return JSONResponse(
                 status_code=400,
                 content={"success": False, "message": "Address ID is required"}
@@ -1636,6 +1761,11 @@ async def get_order(order_id: int, current_user: dict = Depends(get_current_user
                 )
                 raise HTTPException(status_code=403, detail="Access denied: you do not own this order")
 
+    dl = summary.get("delivery_location") or {}
+    logger.info(
+        f"[TRACK_ORDER_API] order_id={order_id} "
+        f"delivery_lat={dl.get('latitude')} delivery_lng={dl.get('longitude')}"
+    )
     return summary
 
 @app.get("/api/customer/orders/{order_id}")
@@ -1942,18 +2072,47 @@ async def get_nearby_restaurants(
 # --- Dialogflow helpers ---
 
 
-def link_chatbot_session(session_id: str, user_id: int) -> None:
+def link_chatbot_session(session_id: str, user_id: int, allow_overwrite: bool = False) -> None:
+    """
+    FIX: Only assign user_id ONCE per session.
+    Subsequent calls are silently ignored unless allow_overwrite=True.
+    This prevents the session→user mapping from being clobbered by repeated
+    link-session calls or re-links triggered by every webhook request.
+    """
     if not session_id or user_id is None:
         return
     # Normalize to strip webdemo- prefix so it matches webhook lookups
     session_id = session_id.removeprefix("webdemo-")
+
     if redis_client:
         try:
-            redis_client.setex(f"chatbot_session:{session_id}", CHATBOT_SESSION_TTL, str(user_id))
+            # FIX: Only write if not already set (NX = set if Not eXists)
+            if allow_overwrite:
+                redis_client.setex(f"chatbot_session:{session_id}", CHATBOT_SESSION_TTL, str(user_id))
+                logger.info(f"[CHATBOT][LINK] (overwrite) session={session_id} → user={user_id}")
+            else:
+                # SET ... NX: write only if the key doesn't already exist
+                written = redis_client.set(
+                    f"chatbot_session:{session_id}",
+                    str(user_id),
+                    ex=CHATBOT_SESSION_TTL,
+                    nx=True,
+                )
+                if written:
+                    logger.info(f"[CHATBOT][LINK] (new) session={session_id} → user={user_id}")
+                else:
+                    existing = redis_client.get(f"chatbot_session:{session_id}")
+                    logger.info(f"[CHATBOT][LINK] (skip overwrite) session={session_id} already → user={existing}")
             return
         except Exception as e:
             logger.warning(f"[CHATBOT] Redis session link failed: {e}")
-    chatbot_session_users[session_id] = (user_id, time.time() + CHATBOT_SESSION_TTL)
+
+    # In-memory fallback — also only write once unless allow_overwrite
+    if allow_overwrite or session_id not in chatbot_session_users:
+        chatbot_session_users[session_id] = (user_id, time.time() + CHATBOT_SESSION_TTL)
+        logger.info(f"[CHATBOT][LINK][MEM] session={session_id} → user={user_id} (overwrite={allow_overwrite})")
+    else:
+        logger.info(f"[CHATBOT][LINK][MEM] (skip overwrite) session={session_id} already mapped")
 
 
 def get_chatbot_user_id(session_id: str):
@@ -2005,8 +2164,9 @@ def get_chatbot_user_id(session_id: str):
 
     if best_user_id:
         logger.info(f"[CHATBOT] Recency fallback resolved user={best_user_id} for session={session_id}")
-        # Cache this mapping so future calls match directly
-        link_chatbot_session(session_id, best_user_id)
+        # Cache this mapping so future calls match directly (allow_overwrite=True
+        # because we just confirmed there is NO existing entry for this session)
+        link_chatbot_session(session_id, best_user_id, allow_overwrite=True)
         return best_user_id
 
     # Redis fallback
@@ -2028,8 +2188,8 @@ def get_chatbot_user_id(session_id: str):
                     if val:
                         uid = int(val)
                         logger.info(f"[CHATBOT] Redis recency fallback resolved user={uid} for session={session_id}")
-                        # Cache this mapping
-                        link_chatbot_session(session_id, uid)
+                        # Cache this mapping (allow_overwrite=True — no entry existed)
+                        link_chatbot_session(session_id, uid, allow_overwrite=True)
                         return uid
         except Exception as e:
             logger.warning(f"[CHATBOT] Redis recency fallback failed: {e}")
@@ -2049,14 +2209,26 @@ def _decode_chatbot_user_token(token: str):
 
 
 def _try_link_chatbot_session_from_request(request: Request, payload: dict, session_id: str) -> None:
+    """
+    FIX: Only links a new session→user mapping if NO mapping exists yet.
+    We never overwrite an existing entry — this stops every webhook call
+    from re-running link logic and potentially clobbering the stored user.
+    """
     if not session_id:
         return
     session_id = session_id.removeprefix("webdemo-")
+
+    # If session already has a user mapped, do nothing
+    existing = get_chatbot_user_id(session_id)
+    if existing:
+        logger.info(f"[CHATBOT][TRY_LINK] session={session_id} already mapped to user={existing} — skipping re-link")
+        return
+
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         uid = _decode_chatbot_user_token(auth_header.split(" ", 1)[1])
         if uid:
-            link_chatbot_session(session_id, uid)
+            link_chatbot_session(session_id, uid)  # allow_overwrite=False by default
             return
     try:
         inner = (payload.get("originalDetectIntentRequest") or {}).get("payload") or {}
@@ -2134,10 +2306,53 @@ def _chatbot_cart_summary(cart: dict) -> str:
     return generic_helper.get_str_from_food_dict(name_qty)
 
 
-def _chatbot_require_user(session_id: str):
+def _has_explicit_quantity(parameters: dict, query_text: str = "") -> bool:
+    """
+    Returns True ONLY when the user's message contains an explicit number.
+    Dialogflow parameters are checked first; raw query_text is the fallback.
+    A missing/empty/[] parameter value means no quantity was stated.
+    """
+    for key in ("number", "Number", "quantity", "amount"):
+        v = parameters.get(key)
+        if v is None or v == "" or v == [] or v == [""]:
+            continue
+        if isinstance(v, list):
+            for x in v:
+                if x is not None and str(x).strip():
+                    try:
+                        float(x)
+                        return True
+                    except (TypeError, ValueError):
+                        pass
+        else:
+            try:
+                float(v)
+                return True
+            except (TypeError, ValueError):
+                pass
+    # Fallback: look for any digit in the raw message
+    return bool(re.search(r'\b\d+\b', query_text))
+
+
+def _chatbot_require_user(session_id: str, fallback_user_id: int = None):
+    """
+    FIX: Resolve user from session map FIRST.
+    Only falls back to fallback_user_id if no session mapping exists.
+    Never prompts login if the session already resolves to a valid user.
+    """
+    # Step 1: Session is the SINGLE SOURCE OF TRUTH
     user_id = get_chatbot_user_id(_chatbot_session_key(session_id))
+
+    # Step 2: Safe fallback — only when session has NO mapping at all
+    if not user_id and fallback_user_id:
+        logger.info(f"[AUTH] _chatbot_require_user: session={session_id} no map, using fallback user={fallback_user_id}")
+        user_id = fallback_user_id
+
     if not user_id:
+        logger.warning(f"[AUTH] _chatbot_require_user: NO user for session={session_id} — prompting login")
         return None, "Please log in on the website before placing an order through chat."
+
+    logger.info(f"[AUTH] _chatbot_require_user: session={session_id} → user={user_id}")
     return user_id, None
 
 
@@ -2193,23 +2408,90 @@ def save_to_db(session_cart: dict, user_id: int):
 
 
 def add_to_order(parameters, session_id):
+    """
+    Quantity-first ordering flow:
+    - Food item with quantity   → add to cart immediately.
+    - Food item WITHOUT quantity → store in pending_orders, ask "How many?".
+    - No food item but pending   → treat message as quantity reply; add pending item.
+    """
     try:
+        # Pop injected query_text (set by handle_request, not Dialogflow)
+        query_text = parameters.pop('_query_text', '')
+
         sid = _chatbot_session_key(session_id)
         user_id, login_err = _chatbot_require_user(session_id)
         if login_err:
             return JSONResponse(content={"fulfillmentText": login_err})
 
-        qty = _chatbot_extract_quantity(parameters)
         foods = _chatbot_extract_food_names(parameters)
+
+        # ── CASE A: No food name in this message ────────────────────────────
+        # The user is either replying with a quantity OR the message is unclear.
         if not foods:
-            return JSONResponse(
-                content={
-                    "fulfillmentText": "I did not catch which dish to add. Please name the item and how many you want."
+            pending = pending_orders.get(session_id)
+            if not pending or not pending.get("item"):
+                return JSONResponse(
+                    content={
+                        "fulfillmentText": (
+                            "Sorry, I didn’t understand. Please order like:\n"
+                            "1 rava dosa\n"
+                            "2 pizzas"
+                        )
+                    }
+                )
+
+            # Resolve pending item with the supplied quantity
+            food_name = pending["item"]
+            qty = _chatbot_extract_quantity(parameters)
+            # Also try raw query if parameters gave the default of 1
+            if qty == 1:
+                m = re.search(r'\b(\d+)\b', query_text)
+                if m:
+                    qty = max(1, int(m.group(1)))
+
+            row = db_helper.get_food_item_by_name(food_name)
+            if not row:
+                pending_orders.pop(session_id, None)
+                return JSONResponse(
+                    content={"fulfillmentText": f"Sorry, {food_name} is not available right now."}
+                )
+
+            cart = inprogress_orders[sid]
+            iid = row["item_id"]
+            if iid in cart:
+                cart[iid]["quantity"] += qty
+            else:
+                cart[iid] = {
+                    "item_id": iid,
+                    "name": row["name"],
+                    "quantity": qty,
+                    "price": float(row["price"]),
                 }
+
+            pending_orders.pop(session_id, None)  # clear pending state
+            logger.info(
+                f"[CHATBOT] add_to_order (pending resolved): {food_name} x{qty} session={sid}"
+            )
+            summary = _chatbot_cart_summary(cart)
+            return JSONResponse(
+                content={"fulfillmentText": f"So far you have {summary}. Do you need anything else?"}
             )
 
+        # ── CASE B: Food name present — check for explicit quantity ─────────
+        if not _has_explicit_quantity(parameters, query_text):
+            return JSONResponse(
+                content={"fulfillmentText": "Please specify quantity like: 1 rava dosa or 2 pizzas."}
+            )
+
+        # ── CASE C: Food name + explicit quantity → add immediately ─────────
+        qty = _chatbot_extract_quantity(parameters)
+        # Supplement with raw query if parameters gave default 1
+        if qty == 1:
+            m = re.search(r'\b(\d+)\b', query_text)
+            if m:
+                qty = max(1, int(m.group(1)))
+
         cart = inprogress_orders[sid]
-        had_items = bool(cart)
         added_any = False
 
         for fname in foods:
@@ -2232,15 +2514,19 @@ def add_to_order(parameters, session_id):
 
         if not added_any:
             return JSONResponse(
-                content={"fulfillmentText": "I did not catch which dish to add. Please name the item and how many you want."}
+                content={
+                    "fulfillmentText": "I did not catch which dish to add. Please name the item and how many you want."
+                }
             )
 
+        # Clear any stale pending state on successful add
+        pending_orders.pop(session_id, None)
+        logger.info(f"[CHATBOT] add_to_order: {foods} x{qty} added session={sid}")
+
         summary = _chatbot_cart_summary(cart)
-        if had_items:
-            text = f"So far you have {summary}"
-        else:
-            text = f"So far you have {summary}. Do you need anything else?"
-        return JSONResponse(content={"fulfillmentText": text})
+        return JSONResponse(
+            content={"fulfillmentText": f"So far you have {summary}. Do you need anything else?"}
+        )
 
     except Exception:
         logger.exception("[CHATBOT] add_to_order")
@@ -2265,6 +2551,7 @@ def remove_from_order(parameters, session_id):
                 content={"fulfillmentText": "I did not catch which dish to remove. Please name the item."}
             )
 
+        removed_any = False
         for fname in foods:
             row = db_helper.get_food_item_by_name(fname)
             if not row:
@@ -2275,6 +2562,13 @@ def remove_from_order(parameters, session_id):
             cart[iid]["quantity"] -= qty
             if cart[iid]["quantity"] <= 0:
                 del cart[iid]
+            removed_any = True
+
+        if not removed_any:
+            if not cart:
+                return JSONResponse(content={"fulfillmentText": "Your order is already empty."})
+            summary = _chatbot_cart_summary(cart)
+            return JSONResponse(content={"fulfillmentText": f"Item not found in your order. So far you have {summary}"})
 
         if not cart:
             return JSONResponse(content={"fulfillmentText": "Your order is now empty."})
@@ -2353,9 +2647,20 @@ def track_order(parameters, session_id):
 
 
 def cancel_order_handler(parameters, session_id):
+    """
+    Only reached when Dialogflow sends order.cancel AND no food item was
+    detected in query_text (the FORCE_ROUTE guard runs before this handler).
+    Cart check lives here — NOT in the global pipeline.
+    """
     try:
         sid = _chatbot_session_key(session_id)
+        cart = inprogress_orders.get(sid, {})
+        if not cart:
+            return JSONResponse(
+                content={"fulfillmentText": "You don't have an active order to cancel."}
+            )
         inprogress_orders[sid].clear()
+        logger.info(f"[CHATBOT] cancel_order_handler: cart cleared for session={sid}")
         return JSONResponse(content={"fulfillmentText": "Your order has been cancelled."})
     except Exception:
         logger.exception("[CHATBOT] cancel_order_handler")

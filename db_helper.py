@@ -271,6 +271,19 @@ def init_db():
             )
     except Exception as e:
         print(f"Migration error for user_addresses: {e}")
+    # Create food_items table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS food_items (
+            item_id INT NOT NULL PRIMARY KEY,
+            name VARCHAR(255),
+            price DECIMAL(10, 2),
+            description TEXT,
+            image_url TEXT,
+            rating DECIMAL(3, 2) DEFAULT 4.50,
+            tag VARCHAR(50)
+        )
+    """)
+
     # Create cart table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS cart (
@@ -325,6 +338,25 @@ def init_db():
             price DECIMAL(10, 2),
             total_price DECIMAL(10, 2),
             FOREIGN KEY (order_id) REFERENCES orders(order_id),
+            FOREIGN KEY (item_id) REFERENCES food_items(item_id)
+        )
+    """)
+
+    # Create orders_backup table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders_backup (
+            order_id INT NOT NULL,
+            item_id INT NOT NULL,
+            quantity INT,
+            total_price DECIMAL(10, 2),
+            status VARCHAR(50) DEFAULT 'Placed',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_amount DECIMAL(10, 2),
+            user_id INT,
+            address_id INT,
+            address TEXT,
+            payment_method VARCHAR(50),
+            PRIMARY KEY (order_id, item_id),
             FOREIGN KEY (item_id) REFERENCES food_items(item_id)
         )
     """)
@@ -412,6 +444,10 @@ def init_db():
         if not check_column_exists('orders', 'version'):
             print("Migration: Adding 'version' to orders")
             cursor.execute("ALTER TABLE orders ADD COLUMN version INT DEFAULT 1")
+            
+        if not check_column_exists('orders', 'updated_at'):
+            print("Migration: Adding 'updated_at' to orders table")
+            cursor.execute("ALTER TABLE orders ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
     except Exception as e:
         print(f"Migration error for orders enhancement: {e}")
 
@@ -731,6 +767,62 @@ def verify_address_ownership(user_id, address_id):
         print(f"Error verifying address: {err}")
         return False
 
+
+def _geocode_address_snapshot(addr_row):
+    """
+    Best-effort forward geocode when user_addresses.latitude/longitude are NULL.
+    Used only at order placement to populate orders.user_lat/user_lng snapshot.
+    """
+    import time
+    import urllib.parse
+    import urllib.request
+
+    line = str(addr_row.get("address_line") or "").strip()
+    city = str(addr_row.get("city") or "").strip()
+    state = str(addr_row.get("state") or "").strip()
+    pincode = str(addr_row.get("pincode") or "").strip()
+
+    queries = []
+    full = ", ".join(p for p in [line, city, state, pincode, "India"] if p)
+    if full:
+        queries.append(full)
+    if line and city:
+        queries.append(", ".join(p for p in [line, city, pincode, "India"] if p))
+    if city and pincode:
+        queries.append(f"{city}, {pincode}, India")
+    if pincode:
+        queries.append(f"{pincode}, India")
+
+    seen = set()
+    headers = {"User-Agent": "PandeyjiEatery-FoodChatbot/1.0 (order-snapshot-geocode)"}
+    for q in queries:
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        try:
+            url = (
+                "https://nominatim.openstreetmap.org/search?"
+                + urllib.parse.urlencode({"format": "json", "limit": "1", "q": q})
+            )
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                rows = json.loads(resp.read().decode())
+            time.sleep(1.1)
+            if not rows:
+                continue
+            lat = float(rows[0]["lat"])
+            lng = float(rows[0]["lon"])
+            if -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0:
+                print(
+                    f"[ORDER_DEBUG] Geocoded address_id={addr_row.get('id')}: "
+                    f"lat={lat}, lng={lng}, query={q!r}"
+                )
+                return lat, lng
+        except Exception as exc:
+            print(f"[ORDER_DEBUG] Geocode failed for {q!r}: {exc}")
+    return None, None
+
+
 def place_order_in_db(user_id, address_id, items=None, payment_method='COD', restaurant_lat=None, restaurant_lng=None, clear_cart=True):
     print("==== ORDER DEBUG START ====")
     print("USER:", user_id)
@@ -812,21 +904,36 @@ def place_order_in_db(user_id, address_id, items=None, payment_method='COD', res
         snap_lat = addr_row.get("latitude")
         snap_lng = addr_row.get("longitude")
 
+        print(f"[ORDER_DEBUG] address_id={address_id} snap_lat={snap_lat!r} snap_lng={snap_lng!r}")
+
         user_lat_snap = None
         user_lng_snap = None
         if snap_lat is not None and snap_lng is not None:
             try:
                 user_lat_snap = float(snap_lat)
                 user_lng_snap = float(snap_lng)
+                if not (-90.0 <= user_lat_snap <= 90.0 and -180.0 <= user_lng_snap <= 180.0):
+                    print(f"[ORDER_DEBUG] Out-of-range coords for address_id={address_id}: lat={user_lat_snap}, lng={user_lng_snap} — storing NULL")
+                    user_lat_snap = None
+                    user_lng_snap = None
             except (TypeError, ValueError):
-                raise Exception(
-                    "DELIVERY_COORDS_INVALID: Saved address coordinates are not valid numbers."
-                )
-            if not (-90.0 <= user_lat_snap <= 90.0 and -180.0 <= user_lng_snap <= 180.0):
-                raise Exception(
-                    "DELIVERY_COORDS_INVALID: Saved address coordinates are out of valid range."
-                )
-        
+                print(f"[ORDER_DEBUG] Non-numeric coords for address_id={address_id}: snap_lat={snap_lat!r}, snap_lng={snap_lng!r} — storing NULL")
+                user_lat_snap = None
+                user_lng_snap = None
+
+        if user_lat_snap is None or user_lng_snap is None:
+            geo_lat, geo_lng = _geocode_address_snapshot(addr_row)
+            if geo_lat is not None and geo_lng is not None:
+                user_lat_snap, user_lng_snap = geo_lat, geo_lng
+                if check_column_exists("user_addresses", "latitude"):
+                    cursor.execute(
+                        "UPDATE user_addresses SET latitude = %s, longitude = %s WHERE id = %s AND user_id = %s",
+                        (user_lat_snap, user_lng_snap, address_id, user_id),
+                    )
+                    print(f"[ORDER_DEBUG] Backfilled address_id={address_id} with geocoded coords")
+
+        print(f"[ORDER_DEBUG] order snapshot user_lat={user_lat_snap!r} user_lng={user_lng_snap!r}")
+
         # 4. Insert into orders table
         # Rule: ONLINE is PAID immediately, COD is PENDING
         initial_payment_status = 'PAID' if payment_method.upper() == 'ONLINE' else 'PENDING'

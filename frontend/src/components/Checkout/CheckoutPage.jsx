@@ -27,7 +27,7 @@ const CheckoutPage = () => {
   const isAuthenticated = !!customerToken;
   const user = customerUser;
   const navigate = useNavigate();
-  
+
   const [addresses, setAddresses] = useState([]);
   const [selectedAddress, setSelectedAddress] = useState(null);
   const [paymentMethod, setPaymentMethod] = useState('COD');
@@ -56,12 +56,12 @@ const CheckoutPage = () => {
       navigate('/login');
       return;
     }
-    
+
     if (isLoaded && cart.length === 0 && !isPlacingOrder) {
       navigate('/menu');
       return;
     }
-    
+
     if (customerToken) {
       fetchAddresses();
     }
@@ -70,14 +70,14 @@ const CheckoutPage = () => {
   const fetchAddresses = async () => {
     try {
       const response = await apiClient.get('/api/address');
-      
+
       const addrData = response?.success ? (response.data || []) : (Array.isArray(response) ? response : []);
       setAddresses(addrData);
-      
+
       // Selection logic: prioritize default, then saved selected, then first
       const defaultAddr = addrData.find(a => a.is_default);
       const savedSelected = localStorage.getItem("selectedAddress");
-      
+
       if (defaultAddr) {
         setSelectedAddress(defaultAddr);
       } else if (savedSelected) {
@@ -114,7 +114,7 @@ const CheckoutPage = () => {
 
       toast.success("Order placed successfully!");
       clearCart();
-      
+
       const orderId = response?.success ? response.data?.order_id : response?.order_id;
       navigate('/order-success', { state: { orderId } });
     } catch (error) {
@@ -124,9 +124,9 @@ const CheckoutPage = () => {
         message: error.message,
         networkError: !!error.networkError
       });
-      
+
       let errMsg = "Failed to place order. Please try again.";
-      
+
       if (error.networkError) {
         errMsg = "Connection failed. The server might be down or unreachable. Your cart is preserved.";
       } else if (error.response?.data?.message) {
@@ -138,7 +138,7 @@ const CheckoutPage = () => {
       } else if (error.detail) {
         errMsg = error.detail;
       }
-      
+
       toast.error(errMsg, { duration: 5000 });
     } finally {
       setIsPlacingOrder(false);
@@ -150,7 +150,7 @@ const CheckoutPage = () => {
       <div className="max-w-[1200px] mx-auto px-4 mt-4 mb-6">
         {/* Header */}
         <div className="flex items-center gap-4 mb-4">
-          <button 
+          <button
             onClick={() => navigate(-1)}
             className="p-2 bg-white border border-gray-200 rounded-md hover:bg-gray-50 transition-colors shadow-sm"
           >
@@ -165,7 +165,7 @@ const CheckoutPage = () => {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-start">
           {/* Main Content (Left) */}
           <div className="md:col-span-2 space-y-6">
-            
+
             {/* Delivery Address Section */}
             <div className="bg-white border border-gray-200 rounded-lg shadow-sm p-5">
               <div className="flex items-center justify-between mb-4">
@@ -173,7 +173,7 @@ const CheckoutPage = () => {
                   <MapPin className="w-5 h-5 text-orange-500" />
                   <h2 className="text-lg font-semibold text-gray-800">Delivery Address</h2>
                 </div>
-                <Link 
+                <Link
                   to="/add-address"
                   className="flex items-center gap-1 text-orange-500 font-medium text-sm hover:text-orange-600"
                 >
@@ -190,17 +190,16 @@ const CheckoutPage = () => {
               ) : addresses.length > 0 ? (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   {addresses.map((addr) => (
-                    <div 
+                    <div
                       key={addr.id}
                       onClick={() => {
                         setSelectedAddress(addr);
                         localStorage.setItem("selectedAddress", JSON.stringify(addr));
                       }}
-                      className={`relative p-4 rounded-md border cursor-pointer transition-all ${
-                        selectedAddress?.id === addr.id 
-                        ? 'border-orange-500 bg-orange-50' 
-                        : 'border-gray-200 bg-white hover:border-gray-300'
-                      }`}
+                      className={`relative p-4 rounded-md border cursor-pointer transition-all ${selectedAddress?.id === addr.id
+                          ? 'border-orange-500 bg-orange-50'
+                          : 'border-gray-200 bg-white hover:border-gray-300'
+                        }`}
                     >
                       {selectedAddress?.id === addr.id && (
                         <div className="absolute top-3 right-3">
@@ -229,7 +228,7 @@ const CheckoutPage = () => {
                 <div className="p-8 text-center bg-gray-50 rounded-md border border-dashed border-gray-300">
                   <MapPin className="w-10 h-10 text-gray-300 mx-auto mb-3" />
                   <p className="text-gray-500 font-medium text-sm mb-4">No saved addresses found</p>
-                  <Link 
+                  <Link
                     to="/add-address"
                     className="inline-block px-6 py-2 bg-orange-500 text-white rounded-md text-sm font-medium hover:bg-orange-600 transition-colors"
                   >
@@ -247,17 +246,15 @@ const CheckoutPage = () => {
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div 
+                <div
                   onClick={() => setPaymentMethod('COD')}
-                  className={`p-4 rounded-md border cursor-pointer transition-all flex items-center gap-3 ${
-                    paymentMethod === 'COD' 
-                    ? 'border-orange-500 bg-orange-50' 
-                    : 'border-gray-200 bg-white hover:border-gray-300'
-                  }`}
+                  className={`p-4 rounded-md border cursor-pointer transition-all flex items-center gap-3 ${paymentMethod === 'COD'
+                      ? 'border-orange-500 bg-orange-50'
+                      : 'border-gray-200 bg-white hover:border-gray-300'
+                    }`}
                 >
-                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                    paymentMethod === 'COD' ? 'border-orange-500' : 'border-gray-300'
-                  }`}>
+                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${paymentMethod === 'COD' ? 'border-orange-500' : 'border-gray-300'
+                    }`}>
                     {paymentMethod === 'COD' && <div className="w-2 h-2 bg-orange-500 rounded-full" />}
                   </div>
                   <div>
@@ -266,7 +263,7 @@ const CheckoutPage = () => {
                   </div>
                 </div>
 
-                <div 
+                <div
                   className={`p-4 rounded-md border opacity-50 flex items-center gap-3 border-gray-100 bg-gray-50 cursor-not-allowed`}
                 >
                   <div className="w-4 h-4 rounded-full border border-gray-300" />
@@ -286,14 +283,14 @@ const CheckoutPage = () => {
                 <ShoppingBag className="w-5 h-5 text-orange-500" />
                 <h3 className="text-lg font-semibold text-gray-800">Order Summary</h3>
               </div>
-              
+
               <div className="space-y-4 mb-6 max-h-[300px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-gray-200">
                 {cart.map((item) => (
                   <div key={item.id || item.item_id} className="flex gap-3">
                     <div className="w-14 h-14 rounded-md overflow-hidden shrink-0 border border-gray-100">
-                      <img 
-                        src={getFoodImage(item.name)} 
-                        alt={item.name} 
+                      <img
+                        src={getFoodImage(item.name)}
+                        alt={item.name}
                         className="w-full h-full object-cover"
                       />
                     </div>
@@ -317,7 +314,7 @@ const CheckoutPage = () => {
                   <span>Delivery Fee</span>
                   <span className="text-green-600">₹{deliveryFee}</span>
                 </div>
-                
+
                 <div className="pt-4 mt-2 border-t border-gray-100 flex justify-between items-center">
                   <span className="text-sm font-semibold text-gray-800">Total</span>
                   <span className="text-xl font-bold text-orange-500">₹{grandTotal}</span>
@@ -325,7 +322,7 @@ const CheckoutPage = () => {
               </div>
 
               <div className="mt-6">
-                <button 
+                <button
                   onClick={handlePlaceOrder}
                   disabled={isPlacingOrder || !selectedAddress}
                   className="w-full py-2 bg-orange-500 text-white rounded-md text-sm font-medium hover:bg-orange-600 transition-colors flex items-center justify-center gap-2 shadow-sm disabled:opacity-50 disabled:bg-gray-300"

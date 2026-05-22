@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { MessageCircle, X } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 import apiClient from '../services/apiClient';
@@ -19,6 +19,7 @@ function getOrCreateSessionId() {
 const ChatbotWidget = () => {
   const { customerToken, isCustomer, loading } = useAuth();
   const [open, setOpen] = useState(false);
+  const sessionLinked = useRef(false);
   const sessionId = useMemo(() => getOrCreateSessionId(), []);
 
   const iframeSrc = useMemo(
@@ -27,10 +28,9 @@ const ChatbotWidget = () => {
   );
 
   const linkSession = async (retries = 3) => {
+    if (sessionLinked.current) return;
     const token = localStorage.getItem('customerToken');
     if (!token) return;
-    const sid = localStorage.getItem('dialogflow_session_id') || sessionId;
-    if (!sid) return;
 
     try {
       const res = await fetch(
@@ -41,11 +41,12 @@ const ChatbotWidget = () => {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + token
           },
-          body: JSON.stringify({ session_id: sid })
+          body: JSON.stringify({ session_id: sessionId })
         }
       );
       const data = await res.json();
       console.log('[CHATBOT] link-session:', data);
+      sessionLinked.current = true;
     } catch (e) {
       console.warn('[CHATBOT] link-session failed, retries left:', retries - 1);
       if (retries > 1) {
@@ -54,8 +55,11 @@ const ChatbotWidget = () => {
     }
   };
 
-  useEffect(() => { linkSession(); }, []);
-  useEffect(() => { if (open) linkSession(); }, [open]);
+  useEffect(() => { 
+    if (customerToken && isCustomer()) {
+      linkSession(); 
+    }
+  }, [customerToken, isCustomer]);
 
   if (loading || !customerToken || !isCustomer()) {
     return null;
