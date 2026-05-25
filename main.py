@@ -646,14 +646,16 @@ async def health_check():
         "mongodb": mongo_status,
     }
 
-@app.get("/health")
-async def health():
-    mongo_status = await mongodb_helper.check_mongodb_health()
+@app.get("/")
+def root():
     return {
         "status": "ok",
-        "redis": redis_service.redis_client is not None,
-        "mongodb": mongo_status,
+        "message": "QuickCrave backend is running"
     }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 # --- RIDER-DEPENDENT STATUSES ---
 RIDER_DEPENDENT_STATUSES = {
