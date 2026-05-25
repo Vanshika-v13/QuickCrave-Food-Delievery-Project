@@ -551,31 +551,16 @@ app = FastAPI()
 
 app_state = {"ready": False}
 
-_CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
-prod_frontend_url = os.getenv("FRONTEND_URL")
-if prod_frontend_url:
-    _CORS_ALLOWED_ORIGINS.append(prod_frontend_url)
-
-
-def _cors_preflight_response(request: Request) -> Response:
-    """200 for OPTIONS preflight — mirrors requested headers (incl. cache-control from axios)."""
-    origin = request.headers.get("origin", "")
-    headers = {
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-        "Access-Control-Max-Age": "86400",
-    }
-    if origin in _CORS_ALLOWED_ORIGINS:
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Access-Control-Allow-Credentials"] = "true"
-        requested = request.headers.get("access-control-request-headers")
-        headers["Access-Control-Allow-Headers"] = requested or "*"
-    elif not origin:
-        headers["Access-Control-Allow-Headers"] = "*"
-    return Response(status_code=200, headers=headers)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "https://quick-crave-food-delievery-project.vercel.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(Exception)
@@ -621,12 +606,7 @@ async def check_ready(request: Request, call_next):
 app.middleware("http")(rate_limit_middleware)
 
 
-@app.middleware("http")
-async def options_preflight_middleware(request: Request, call_next):
-    """Outermost: OPTIONS never hits auth, rate limits, or route validation."""
-    if request.method == "OPTIONS":
-        return _cors_preflight_response(request)
-    return await call_next(request)
+
 
 
 if os.path.exists("frontend/public/images"):
