@@ -192,9 +192,12 @@ def _clear_rider_redis(rider_id: int) -> None:
         import redis
         import os
 
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        REDIS_URL = os.getenv("REDIS_URL")
+        if not REDIS_URL:
+            return
+
         r = redis.from_url(
-            redis_url,
+            REDIS_URL,
             decode_responses=True,
             socket_timeout=0.3,
         )

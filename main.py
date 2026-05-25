@@ -53,20 +53,24 @@ ENABLE_NEARBY_FEATURE = False
 # --- Redis Integration (Hardened Startup) ---
 import os
 
-redis_client = None
-try:
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    redis_client = redis.from_url(
-        redis_url, 
-        decode_responses=True, 
-        socket_timeout=0.5, 
-        socket_connect_timeout=0.5
-    )
-    redis_client.ping()
-    logger.info("[REDIS] Connection established.")
-except Exception as e:
+REDIS_URL = os.getenv("REDIS_URL")
+
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            socket_timeout=0.5, 
+            socket_connect_timeout=0.5
+        )
+        redis_client.ping()
+        logger.info("[REDIS] Connection established.")
+    except Exception as e:
+        redis_client = None
+        logger.warning(f"Redis disabled - running in degraded mode: {e}")
+else:
     redis_client = None
-    logger.warning(f"Redis disabled - running in degraded mode: {e}")
+    logger.warning("Redis disabled - no REDIS_URL found")
     
 import os
 logger.info(f"[DEBUG] MONGODB_DATABASE from env: {os.getenv('MONGODB_DATABASE', 'food_delivery')}")
