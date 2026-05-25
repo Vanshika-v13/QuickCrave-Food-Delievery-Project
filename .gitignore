@@ -1,53 +1,91 @@
+############################################
+# Logs
+############################################
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+############################################
+# Dependencies
+############################################
+node_modules/
+*/node_modules/
+
+############################################
 # Python caches and compiled files
+############################################
 __pycache__/
 *.py[cod]
 *$py.class
 
+############################################
 # Environments
+############################################
 .env
+.env.*
+!.env.example
 .venv/
-env/
 venv/
+env/
 ENV/
 env.bak/
 venv.bak/
 
-# Logs and databases
-*.log
+############################################
+# Build outputs
+############################################
+dist/
+dist-ssr/
+build/
+*/dist/
+*/build/
+
+############################################
+# Databases / runtime files
+############################################
 *.sqlite
 dump.rdb
 
+############################################
 # IDEs and Editors
-.idea/
+############################################
 .vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
 *.swp
 *.swo
+*.sw?
 
-# Web and Frontend (React/Vite)
-node_modules/
-dist/
-dist-ssr/
-frontend/node_modules/
-frontend/dist/
-*.local
+############################################
+# Web / Frontend (React / Vite)
+############################################
 .eslintcache
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+.vite/
+.cache/
+*.local
 
+############################################
 # Deployments
+############################################
 .vercel/
 .render/
 
+############################################
 # Tools
+############################################
 ngrok
 ngrok.exe
 
-# Personal / temporary files
-command.txt
-*.txt
-
+############################################
 # OS generated files
+############################################
 .DS_Store
 .DS_Store?
 ._*
@@ -56,5 +94,13 @@ command.txt
 ehthumbs.db
 Thumbs.db
 
+############################################
+# Temporary / personal files
+############################################
+command.txt
+*.txt
 
+############################################
+# Documentation (migration / internal docs)
+############################################
 docs/migration/
