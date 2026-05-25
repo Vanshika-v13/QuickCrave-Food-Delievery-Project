@@ -51,17 +51,22 @@ import inspect
 # --- FEATURE FLAGS ---
 ENABLE_NEARBY_FEATURE = False
 # --- Redis Integration (Hardened Startup) ---
+import os
+
 redis_client = None
 try:
-    redis_client = redis.Redis(
-        host='localhost', port=6379, db=0, 
-        decode_responses=True, socket_timeout=0.5, socket_connect_timeout=0.5
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_client = redis.from_url(
+        redis_url, 
+        decode_responses=True, 
+        socket_timeout=0.5, 
+        socket_connect_timeout=0.5
     )
     redis_client.ping()
     logger.info("[REDIS] Connection established.")
 except Exception as e:
     redis_client = None
-    logger.warning("Redis disabled - running in degraded mode")
+    logger.warning(f"Redis disabled - running in degraded mode: {e}")
     
 import os
 logger.info(f"[DEBUG] MONGODB_DATABASE from env: {os.getenv('MONGODB_DATABASE', 'food_delivery')}")
@@ -566,6 +571,10 @@ _CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 
+prod_frontend_url = os.getenv("FRONTEND_URL")
+if prod_frontend_url:
+    _CORS_ALLOWED_ORIGINS.append(prod_frontend_url)
+
 
 def _cors_preflight_response(request: Request) -> Response:
     """200 for OPTIONS preflight — mirrors requested headers (incl. cache-control from axios)."""
@@ -635,7 +644,10 @@ async def options_preflight_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-app.mount("/images", StaticFiles(directory="frontend/public/images"), name="images")
+if os.path.exists("frontend/public/images"):
+    app.mount("/images", StaticFiles(directory="frontend/public/images"), name="images")
+else:
+    logger.warning("Static files directory 'frontend/public/images' does not exist. Image mounting skipped.")
 
 # --- Health Check Endpoint (No Auth Required) ---
 @app.get("/api/health")
