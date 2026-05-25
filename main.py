@@ -3520,21 +3520,6 @@ def cancel_order_handler(parameters, session_id):
         return JSONResponse(content={"fulfillmentText": "Something went wrong. Please try again."})
 
 
-@app.options("/{rest_of_path:path}")
-async def global_options_handler(rest_of_path: str, request: Request):
-    """Catch-all OPTIONS so preflight never hits POST-only route validation (400/405)."""
-    return _cors_preflight_response(request)
-
-
-# Registered last so it wraps all routes/middleware (outermost — handles CORS on every response).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(_CORS_ALLOWED_ORIGINS),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
 
 if __name__ == "__main__":
     import uvicorn
