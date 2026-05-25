@@ -41,7 +41,6 @@ from fastapi.staticfiles import StaticFiles
 import time
 import math
 from collections import defaultdict
-import redis
 import re
 import json
 import bcrypt
@@ -51,26 +50,8 @@ import inspect
 # --- FEATURE FLAGS ---
 ENABLE_NEARBY_FEATURE = False
 # --- Redis Integration (Hardened Startup) ---
-import os
-
-REDIS_URL = os.getenv("REDIS_URL")
-
-if REDIS_URL:
-    try:
-        redis_client = redis.from_url(
-            REDIS_URL, 
-            decode_responses=True, 
-            socket_timeout=0.5, 
-            socket_connect_timeout=0.5
-        )
-        redis_client.ping()
-        logger.info("[REDIS] Connection established.")
-    except Exception as e:
-        redis_client = None
-        logger.warning(f"Redis disabled - running in degraded mode: {e}")
-else:
-    redis_client = None
-    logger.warning("Redis disabled - no REDIS_URL found")
+from services import redis_service
+from services.redis_service import init_redis, get_cache, set_cache
     
 import os
 logger.info(f"[DEBUG] MONGODB_DATABASE from env: {os.getenv('MONGODB_DATABASE', 'food_delivery')}")
@@ -356,9 +337,9 @@ class EcosystemSocketManager:
             self.rooms[room].append(websocket)
             
             # Track active session in Redis
-            if redis_client:
+            if redis_service.redis_client:
                 try:
-                    redis_client.sadd(f"active_rooms:{room}", str(id(websocket)))
+                    redis_service.redis_client.sadd(f"active_rooms:{room}", str(id(websocket)))
                 except Exception as e:
                     logger.warning(f"[REDIS] Failed to track presence: {e}")
                 
@@ -374,17 +355,17 @@ class EcosystemSocketManager:
         if room in self.rooms and websocket in self.rooms[room]:
             self.rooms[room].remove(websocket)
             
-            if redis_client:
+            if redis_service.redis_client:
                 try:
-                    redis_client.srem(f"active_rooms:{room}", str(id(websocket)))
+                    redis_service.redis_client.srem(f"active_rooms:{room}", str(id(websocket)))
                 except:
                     pass
                     
             if not self.rooms[room] and room != "admin_monitor":
                 del self.rooms[room]
-                if redis_client:
+                if redis_service.redis_client:
                     try:
-                        redis_client.delete(f"active_rooms:{room}")
+                        redis_service.redis_client.delete(f"active_rooms:{room}")
                     except:
                         pass
         logger.info(f"[WS] Room '{room}' left.")
@@ -420,12 +401,12 @@ class EcosystemSocketManager:
         payload_str = json.dumps(payload, sort_keys=True)
         
         # Deduplication using Redis
-        if redis_client:
+        if redis_service.redis_client:
             try:
-                last_p = redis_client.get(f"last_payload:{room}")
+                last_p = get_cache(f"last_payload:{room}")
                 if last_p == payload_str:
                     return
-                redis_client.set(f"last_payload:{room}", payload_str, ex=3600)
+                set_cache(f"last_payload:{room}", payload_str, 3600)
             except Exception as e:
                 logger.warning(f"[REDIS] Broadcast deduplication failed: {e}")
                 if last_payloads.get(room) == payload_str:
@@ -661,7 +642,7 @@ async def health_check():
     return {
         "success": True,
         "status": "ok",
-        "redis": redis_client is not None,
+        "redis": redis_service.redis_client is not None,
         "mongodb": mongo_status,
     }
 
@@ -670,7 +651,7 @@ async def health():
     mongo_status = await mongodb_helper.check_mongodb_health()
     return {
         "status": "ok",
-        "redis": redis_client is not None,
+        "redis": redis_service.redis_client is not None,
         "mongodb": mongo_status,
     }
 
@@ -690,8 +671,8 @@ def is_rider_online(rider_id: int) -> bool:
 
     if user_repository.is_rider_online_db(rider_id):
         return True
-    if redis_client:
-        return redis_client.sismember("online_riders", str(rider_id))
+    if redis_service.redis_client:
+        return redis_service.redis_client.sismember("online_riders", str(rider_id))
     return False
 
 
@@ -701,9 +682,9 @@ def clear_order_broadcast_cache(order_id: int, rider_id: int = None) -> None:
     if rider_id:
         rooms.append(f"rider_{rider_id}")
     for room in rooms:
-        if redis_client:
+        if redis_service.redis_client:
             try:
-                redis_client.delete(f"last_payload:{room}")
+                redis_service.redis_client.delete(f"last_payload:{room}")
             except Exception:
                 pass
         last_payloads.pop(room, None)
@@ -712,6 +693,7 @@ def clear_order_broadcast_cache(order_id: int, rider_id: int = None) -> None:
 @app.on_event("startup")
 async def startup_event():
     """Safe Startup Wrapper."""
+    init_redis()
     try:
         logger.info("[SERVER] Initializing services...")
         from repositories.mongo_client import get_client
@@ -1664,14 +1646,14 @@ async def rider_set_online(request: Request, current_user: dict = Depends(get_cu
     online = bool(payload.get("online", True))
     rider_id = current_user["user_id"]
     rider_service.set_rider_online(rider_id, online)
-    if online and redis_client:
+    if online and redis_service.redis_client:
         try:
-            redis_client.sadd("online_riders", str(rider_id))
+            redis_service.redis_client.sadd("online_riders", str(rider_id))
         except Exception:
             pass
-    elif not online and redis_client:
+    elif not online and redis_service.redis_client:
         try:
-            redis_client.srem("online_riders", str(rider_id))
+            redis_service.redis_client.srem("online_riders", str(rider_id))
         except Exception:
             pass
     await ecosystem_socket_manager.push_rider_status_update(
@@ -1708,8 +1690,8 @@ async def update_location(request: Request, current_user: dict = Depends(get_cur
             
         # 1. Throttling Logic (Redis-backed)
         throttle_key = f"rider_throttle:{rider_id}"
-        if redis_client:
-            last_pos_data = redis_client.get(throttle_key)
+        if redis_service.redis_client:
+            last_pos_data = get_cache(throttle_key)
             if last_pos_data:
                 last_pos = json.loads(last_pos_data)
                 time_diff = now - last_pos["time"]
@@ -1736,9 +1718,9 @@ async def update_location(request: Request, current_user: dict = Depends(get_cur
         
         # 3. Update Persistence (Redis & DB)
         pos_payload = {"lat": smoothed_lat, "lng": smoothed_lng, "time": now}
-        if redis_client:
-            redis_client.set(throttle_key, json.dumps(pos_payload), ex=3600)
-            redis_client.set(f"rider_last_known:{rider_id}", json.dumps({
+        if redis_service.redis_client:
+            set_cache(throttle_key, json.dumps(pos_payload), 3600)
+            redis_service.redis_client.set(f"rider_last_known:{rider_id}", json.dumps({
                 "lat": smoothed_lat, "lng": smoothed_lng, "heading": heading, "speed": speed, "updated_at": now
             }))
         else:
@@ -1782,9 +1764,9 @@ async def rider_ws(websocket: WebSocket):
         from repositories import user_repository
 
         user_repository.set_rider_online(rider_id, True)
-        if redis_client:
+        if redis_service.redis_client:
             try:
-                redis_client.sadd("online_riders", str(rider_id))
+                redis_service.redis_client.sadd("online_riders", str(rider_id))
                 logger.info("[RIDER_WS] Rider %s connected (mongo+redis online)", rider_id)
             except Exception as e:
                 logger.warning(f"[REDIS] Presence tracking failed: {e}")
@@ -1814,9 +1796,9 @@ async def rider_ws(websocket: WebSocket):
         logger.error(f"[RIDER][WS] Error: {e}")
     finally:
         if "rider_id" in locals():
-            if redis_client:
+            if redis_service.redis_client:
                 try:
-                    redis_client.srem("online_riders", str(rider_id))
+                    redis_service.redis_client.srem("online_riders", str(rider_id))
                 except Exception:
                     pass
             logger.info("[RIDER_WS] Rider %s socket closed (mongo online preserved)", rider_id)
@@ -2391,12 +2373,12 @@ def link_chatbot_session(
     chatbot_user_last_link[user_id] = (canonical, expires_at)
 
     for variant in _session_id_variants(canonical):
-        if redis_client:
+        if redis_service.redis_client:
             try:
                 if allow_overwrite:
-                    redis_client.setex(f"chatbot_session:{variant}", CHATBOT_SESSION_TTL, str(user_id))
+                    redis_service.redis_client.setex(f"chatbot_session:{variant}", CHATBOT_SESSION_TTL, str(user_id))
                 else:
-                    redis_client.set(
+                    redis_service.redis_client.set(
                         f"chatbot_session:{variant}",
                         str(user_id),
                         ex=CHATBOT_SESSION_TTL,
@@ -2459,9 +2441,9 @@ def _read_session_mapped_user_id(session_id: str, *, allow_fuzzy: bool = True) -
     now = time.time()
 
     for variant in _session_id_variants(canonical):
-        if redis_client:
+        if redis_service.redis_client:
             try:
-                val = redis_client.get(f"chatbot_session:{variant}")
+                val = get_cache(f"chatbot_session:{variant}")
                 if val is not None:
                     return int(val)
             except Exception as e:

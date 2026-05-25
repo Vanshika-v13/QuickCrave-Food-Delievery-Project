@@ -188,23 +188,9 @@ def _append_tracking(
 
 
 def _clear_rider_redis(rider_id: int) -> None:
-    try:
-        import redis
-        import os
-
-        REDIS_URL = os.getenv("REDIS_URL")
-        if not REDIS_URL:
-            return
-
-        r = redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_timeout=0.3,
-        )
-        r.delete(f"rider_last_known:{rider_id}")
-        r.delete(f"rider_throttle:{rider_id}")
-    except Exception:
-        pass
+    from services.redis_service import delete_cache
+    delete_cache(f"rider_last_known:{rider_id}")
+    delete_cache(f"rider_throttle:{rider_id}")
 
 
 def insert_order_tracking(

@@ -98,7 +98,7 @@ Thumbs.db
 # Temporary / personal files
 ############################################
 command.txt
-*.txt
+
 
 ############################################
 # Documentation (migration / internal docs)
