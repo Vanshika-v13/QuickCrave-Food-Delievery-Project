@@ -3,16 +3,11 @@ import { Link, Outlet, useLocation } from 'react-router-dom';
 import { MapPin, Phone, Mail } from 'lucide-react';
 import Navbar from '../components/Navbar';
 import CartDrawer from '../components/CartDrawer';
-import ChatbotWidget from '../components/ChatbotWidget';
 
 const MainLayout = () => {
   const location = useLocation();
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-
-  const isCustomerLayoutSection =
-    /^\/(home|menu|nearby|checkout|add-address|orders|order-success)$/.test(location.pathname) ||
-    /^\/track-order(\/.*)?$/.test(location.pathname);
 
   return (
     <div className="min-h-screen bg-white">
@@ -76,7 +71,6 @@ const MainLayout = () => {
       </footer>
 
       <CartDrawer isOpen={isCartOpen} onClose={() => setIsCartOpen(false)} />
-      {isCustomerLayoutSection ? <ChatbotWidget /> : null}
     </div>
   );
 };
