@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { MessageCircle, X } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
-import apiClient from '../services/apiClient';
+import { API_BASE_URL } from '../config/constants';
 
 const SESSION_STORAGE_KEY = 'dialogflow_session_id';
 const IFRAME_EMBED_URL =
@@ -20,6 +20,7 @@ const ChatbotWidget = () => {
   const { customerToken, isCustomer, loading } = useAuth();
   const [open, setOpen] = useState(false);
   const sessionLinked = useRef(false);
+  const linkInFlight = useRef(false);
   const sessionId = useMemo(() => getOrCreateSessionId(), []);
 
   const iframeSrc = useMemo(
@@ -27,37 +28,46 @@ const ChatbotWidget = () => {
     [sessionId]
   );
 
-  const linkSession = async (retries = 3) => {
-    if (sessionLinked.current) return;
+  const linkSession = async (retries = 2) => {
+    if (sessionLinked.current || linkInFlight.current) return;
     const token = localStorage.getItem('customerToken');
     if (!token) return;
 
+    linkInFlight.current = true;
     try {
-      const res = await fetch(
-        `${window.location.protocol}//${window.location.hostname}:8000/api/chatbot/link-session`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + token
-          },
-          body: JSON.stringify({ session_id: sessionId })
-        }
-      );
-      const data = await res.json();
-      console.log('[CHATBOT] link-session:', data);
+      const res = await fetch(`${API_BASE_URL}/api/chatbot/link-session`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      // Any valid JSON HTTP response — do not retry (even when success is false).
       sessionLinked.current = true;
-    } catch (e) {
-      console.warn('[CHATBOT] link-session failed, retries left:', retries - 1);
-      if (retries > 1) {
-        setTimeout(() => linkSession(retries - 1), 3000);
+      if (data?.success) {
+        console.log('[CHATBOT] link-session ok:', data.session_id, data.user_id);
+      } else {
+        console.warn('[CHATBOT] link-session rejected:', data?.error || res.status);
       }
+      return;
+    } catch (e) {
+      console.warn('[CHATBOT] link-session network error, retries left:', retries - 1, e);
+      if (retries > 1) {
+        linkInFlight.current = false;
+        setTimeout(() => linkSession(retries - 1), 3000);
+        return;
+      }
+    } finally {
+      linkInFlight.current = false;
     }
   };
 
-  useEffect(() => { 
+  useEffect(() => {
     if (customerToken && isCustomer()) {
-      linkSession(); 
+      linkSession();
     }
   }, [customerToken, isCustomer]);
 

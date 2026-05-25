@@ -47,10 +47,9 @@ const destinationIcon = L.divIcon({
 
 const ROUTE_FROM_RIDER_STATUSES = new Set([
   'ASSIGNED',
-  'ACCEPTED',
-  'ORDER_PICKED_UP',
-  'OUT_FOR_DELIVERY',
-  'NEAR_CUSTOMER_LOCATION',
+  'PICKED_UP',
+  'ON_WAY',
+  'ARRIVING',
 ]);
 
 /** Read rider lat/lng — prefer order snapshot (WS/API), then live driver state. */
@@ -224,7 +223,7 @@ const TrackOrderPage = () => {
 
   const [driverLocation, setDriverLocation] = useState(null);
   const [interpolatedDriverPos, setInterpolatedDriverPos] = useState(null);
-  const [status, setStatus] = useState("ORDER_PLACED");
+  const [status, setStatus] = useState("PLACED");
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [route, setRoute] = useState([]);
@@ -810,18 +809,18 @@ const TrackOrderPage = () => {
 
   // Rule 11: Memoize derived timeline calculations to prevent unnecessary re-renders
   const statusStepsWithIcons = useMemo(() => [
-    { id: 'ORDER_PLACED', label: 'Placed', icon: ShoppingBag },
-    { id: 'RESTAURANT_CONFIRMED', label: 'Confirmed', icon: CheckCircle2 },
-    { id: 'FOOD_READY', label: 'Ready', icon: PackageCheck },
+    { id: 'PLACED', label: 'Placed', icon: ShoppingBag },
+    { id: 'CONFIRMED', label: 'Confirmed', icon: CheckCircle2 },
+    { id: 'READY', label: 'Ready', icon: PackageCheck },
     { id: 'ASSIGNED', label: 'Assigned', icon: Bike },
-    { id: 'ORDER_PICKED_UP', label: 'Picked Up', icon: HandHelping },
-    { id: 'OUT_FOR_DELIVERY', label: 'On Way', icon: Bike },
-    { id: 'NEAR_CUSTOMER_LOCATION', label: 'Arriving', icon: MapPin },
+    { id: 'PICKED_UP', label: 'Picked Up', icon: HandHelping },
+    { id: 'ON_WAY', label: 'On Way', icon: Bike },
+    { id: 'ARRIVING', label: 'Arriving', icon: MapPin },
     { id: 'DELIVERED', label: 'Delivered', icon: Flag }
   ], []);
 
   const currentStepIndex = useMemo(() =>
-    statusStepsWithIcons.findIndex(s => s.id === status),
+    statusStepsWithIcons.findIndex(s => s.id === normalizeStatus(status)),
     [status, statusStepsWithIcons]);
 
   const center = useMemo(() => {

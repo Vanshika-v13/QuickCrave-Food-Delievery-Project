@@ -3,6 +3,7 @@ import { API_BASE_URL } from '../config/constants';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json',
     'Pragma': 'no-cache',
@@ -211,7 +212,7 @@ export async function requestWithRetry(fn, retries = 1) {
   try {
     return await fn();
   } catch (err) {
-    const isNetworkError = err?.error === "NETWORK_ERROR" || err?.networkError || !err?.response;
+    const isNetworkError = err?.error === "NETWORK_ERROR";
     if (isNetworkError && retries > 0) {
       console.warn(`[API][RETRY] Retrying request (${retries} left)...`);
       await new Promise(r => setTimeout(r, 2500)); // retry after 2-3 seconds instead of redirecting

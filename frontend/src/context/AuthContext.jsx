@@ -83,6 +83,7 @@ export function AuthProvider({ children }) {
   const logoutRider = useCallback(() => {
     localStorage.removeItem('riderToken');
     localStorage.removeItem('riderUser');
+    localStorage.removeItem('rider_online');
     setRiderToken(null);
     setRiderUser(null);
     window.dispatchEvent(new Event('storage'));

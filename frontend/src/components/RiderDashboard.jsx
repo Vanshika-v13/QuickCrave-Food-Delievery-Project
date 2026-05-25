@@ -5,7 +5,7 @@ import {
   Phone, ChevronRight, User, Play, Square, Loader2
 } from 'lucide-react';
 import { Routes, Route, Navigate, Link, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { getStatusUI, normalizeStatus, getStatusLabel, compareStatus, getEtaCountdownText } from '../services/statusService';
+import { getStatusUI, normalizeStatus, getStatusLabel, compareStatus, getEtaCountdownText, isRiderAccepted } from '../services/statusService';
 import apiClient from '../services/apiClient';
 import { WS_BASE_URL, ROLES } from '../config/constants';
 import { useAuth } from '../hooks/useAuth';
@@ -32,16 +32,25 @@ const RiderDashboard = () => {
   const safeAvailableOrders = Array.isArray(availableOrders) ? availableOrders : [];
   const riderId = riderUser?.id;
   const AVAILABLE_STATUSES = new Set(['ASSIGNED']);
-  const ACTIVE_STATUSES = new Set(['ACCEPTED', 'ORDER_PICKED_UP', 'OUT_FOR_DELIVERY']);
+  const ACTIVE_STATUSES = new Set(['PICKED_UP', 'ON_WAY', 'ARRIVING']);
   const HISTORY_STATUSES = new Set(['DELIVERED']);
+  const RIDER_ONLINE_KEY = 'rider_online';
 
   const getOrderStatusValue = (order) => normalizeStatus(order?.status?.current_status || order?.status);
   const isOrderForCurrentRider = (order) => {
     const orderRiderId = order?.rider_id ?? order?.rider?.id ?? order?.rider?.riderId;
     return Number(orderRiderId) === Number(riderId);
   };
-  const isAvailableOrder = (order) => isOrderForCurrentRider(order) && AVAILABLE_STATUSES.has(getOrderStatusValue(order));
-  const isActiveOrder = (order) => isOrderForCurrentRider(order) && ACTIVE_STATUSES.has(getOrderStatusValue(order));
+  const isAvailableOrder = (order) =>
+    isOrderForCurrentRider(order) &&
+    AVAILABLE_STATUSES.has(getOrderStatusValue(order)) &&
+    !isRiderAccepted(order);
+  const isActiveOrder = (order) => {
+    if (!isOrderForCurrentRider(order)) return false;
+    const st = getOrderStatusValue(order);
+    if (ACTIVE_STATUSES.has(st)) return true;
+    return st === 'ASSIGNED' && isRiderAccepted(order);
+  };
   const isHistoryOrder = (order) => isOrderForCurrentRider(order) && HISTORY_STATUSES.has(getOrderStatusValue(order));
 
   const formatAddress = (addr) => {
@@ -351,9 +360,13 @@ const RiderDashboard = () => {
     }
   };
 
-  const requestGoOffline = () => {
+  const requestGoOffline = async () => {
     geoBlockedRef.current = false;
     setIsOnline(false);
+    localStorage.removeItem(RIDER_ONLINE_KEY);
+    try {
+      await apiClient.put('/api/rider/online', { online: false });
+    } catch (_) {}
     setGpsPermissionMessage('');
     lastBroadcastPosRef.current = null;
     if (gpsWatchIdRef.current && typeof navigator !== 'undefined' && navigator.geolocation) {
@@ -391,6 +404,12 @@ const RiderDashboard = () => {
       geoBlockedRef.current = false;
       lastBroadcastPosRef.current = null;
       setIsOnline(true);
+      localStorage.setItem(RIDER_ONLINE_KEY, '1');
+      try {
+        await apiClient.put('/api/rider/online', { online: true });
+      } catch (e) {
+        console.warn('[RIDER] Could not persist online state:', e);
+      }
     } catch (err) {
       const code = err?.code;
       const msg =
@@ -525,6 +544,14 @@ const RiderDashboard = () => {
     }
 
     prevRiderTokenRef.current = riderToken || null;
+  }, [riderToken]);
+
+  useEffect(() => {
+    if (!riderToken || isLoggedOutRef.current) return;
+    if (localStorage.getItem('auth_hydrated') !== 'true') return;
+    if (localStorage.getItem(RIDER_ONLINE_KEY) !== '1') return;
+    if (isOnline || goingOnlineRef.current) return;
+    requestGoOnline();
   }, [riderToken]);
 
   // Visibility Change Handling
@@ -1037,16 +1064,16 @@ const RiderDashboard = () => {
                     {/* UI GUARD: Ensure activeOrder exists before rendering action buttons */}
                     {(!activeOrder || !activeOrder.order_id) ? null : (
                       <>
-                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ACCEPTED' && (
+                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ASSIGNED' && isRiderAccepted(activeOrder) && (
                           <button 
-                            onClick={() => handleUpdateStatus('ORDER_PICKED_UP')}
+                            onClick={() => handleUpdateStatus('PICKED_UP')}
                             disabled={isUpdating}
                             className="flex-1 bg-[#f97316] text-white px-6 py-4 rounded-lg font-black uppercase tracking-widest text-sm hover:opacity-90 transition-all shadow-lg shadow-orange-500/20 disabled:opacity-50"
                           >
                             Confirm Pickup
                           </button>
                         )}
-                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ASSIGNED' && (
+                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ASSIGNED' && !isRiderAccepted(activeOrder) && (
                           <button
                             onClick={() => handleAcceptOrder(activeOrder.order_id)}
                             disabled={isUpdating}
@@ -1055,21 +1082,25 @@ const RiderDashboard = () => {
                             Accept Order
                           </button>
                         )}
-                        {normalizeRiderStatusForFlow(activeOrder.status) === 'FOOD_READY' && (
-                          <div className="flex-1 text-center py-4 bg-orange-50 text-[#f97316] rounded-lg font-black uppercase tracking-widest text-xs border border-orange-100">
-                            Waiting for rider assignment.
-                          </div>
-                        )}
-                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ORDER_PICKED_UP' && (
+                        {normalizeRiderStatusForFlow(activeOrder.status) === 'PICKED_UP' && (
                           <button 
-                            onClick={() => handleUpdateStatus('OUT_FOR_DELIVERY')}
+                            onClick={() => handleUpdateStatus('ON_WAY')}
                             disabled={isUpdating}
                             className="flex-1 bg-[#f97316] text-white px-6 py-4 rounded-lg font-black uppercase tracking-widest text-sm hover:opacity-90 transition-all shadow-lg shadow-orange-500/20 disabled:opacity-50"
                           >
                             On The Way
                           </button>
                         )}
-                        {normalizeRiderStatusForFlow(activeOrder.status) === 'OUT_FOR_DELIVERY' && (
+                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ON_WAY' && (
+                          <button 
+                            onClick={() => handleUpdateStatus('ARRIVING')}
+                            disabled={isUpdating}
+                            className="flex-1 bg-indigo-600 text-white px-6 py-4 rounded-lg font-black uppercase tracking-widest text-sm hover:opacity-90 transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50"
+                          >
+                            Arriving
+                          </button>
+                        )}
+                        {normalizeRiderStatusForFlow(activeOrder.status) === 'ARRIVING' && (
                           <button 
                             onClick={() => handleUpdateStatus('DELIVERED')}
                             disabled={isUpdating}

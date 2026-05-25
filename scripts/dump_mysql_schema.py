@@ -1,14 +1,25 @@
+#!/usr/bin/env python3
+"""
+MySQL schema dump — migration/dev utility only. Not used at runtime.
+
+Usage:
+  python scripts/dump_mysql_schema.py
+"""
 import mysql.connector
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv('c:\\Food Chatbot\\.env')
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 
 cnx = mysql.connector.connect(
-    host=os.getenv("DB_HOST", "localhost"),
-    user=os.getenv("DB_USER", "root"),
-    password=os.getenv("DB_PASSWORD", "vanshiv1303"),
-    database=os.getenv("DB_NAME", "pandeyji_eatery")
+    host=os.getenv("DB_HOST"),
+    port=int(os.getenv("DB_PORT", 4000)),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    database=os.getenv("DB_NAME"),
 )
 
 cursor = cnx.cursor()

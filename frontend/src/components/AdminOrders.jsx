@@ -38,63 +38,55 @@ const AdminOrders = () => {
     }
   };
 
-  const assignRider = useCallback(async (orderId, riderId, isAuto = false) => {
-    // CONCURRENT ASSIGNMENT PROTECTION:
-    // If an assignment call is already in-flight for this order, drop the extra click silently.
-    if (pendingAssignmentRef.current.has(orderId)) {
-      return;
-    }
-    pendingAssignmentRef.current.add(orderId);
-    try {
-      setIsUpdating(prev => ({ ...prev, [orderId]: true }));
-      const response = await apiClient.put(`/api/admin/orders/${orderId}/assign-rider`, { rider_id: riderId });
-      
-      if (response?.success) {
-        if (!isAuto) toast.success(`Rider assigned to #${orderId}`);
-        // Update only the rider fields locally; do NOT touch order.status
-        // (status is the backend's source of truth — will sync on next poll)
-        setOrders(prev => prev.map(o => 
-          o.order_id === orderId 
-            ? { ...o, rider_id: riderId, rider: { ...(o.rider || {}), id: riderId, riderId, name: riders.find(r => r.id === riderId)?.name } } 
-            : o
-        ));
-        // Refresh riders list so busy/available status is up to date
-        fetchRiders();
-      } else {
-        if (!isAuto) toast.error(response?.message || "Failed to assign rider");
-      }
-    } catch (err) {
-      // Surface the real backend error message (e.g. "This rider already has an active delivery")
-      const backendMsg =
-        err?.response?.data?.message ||
-        err?.response?.data?.detail ||
-        err?.message ||
-        "Connection error during assignment";
-      console.error("Assignment error:", {
-        status: err?.response?.status,
-        data: err?.response?.data,
-        message: err?.message,
-        orderId,
-        riderId
+  const formatRiderLabel = (r) => {
+    const name = r?.rider_name || r?.name || 'Rider';
+    const status = r?.rider_status || ((Number(r?.active_orders_count ?? r?.active_orders ?? 0) > 0) ? 'busy' : 'available');
+    if (status === 'busy') return `${name} (Busy)`;
+    return `${name} (Available)`;
+  };
+
+  const getRiderOptionsForOrder = useCallback((order) => {
+    const assignedKey = order?.rider_id != null && order?.rider_id !== '' ? String(order.rider_id) : null;
+    const byId = new Map();
+
+    riders.forEach((r) => {
+      if (!r?.is_active) return;
+      byId.set(String(r.id), r);
+    });
+
+    if (assignedKey && !byId.has(assignedKey)) {
+      const activeCount = Number(
+        order.rider_active_orders ?? order?.rider?.active_orders_count ?? order?.rider?.active_orders ?? 0
+      );
+      const workStatus = order?.rider?.rider_status || (activeCount > 0 ? 'busy' : 'available');
+      byId.set(assignedKey, {
+        id: Number(order.rider_id),
+        rider_id: Number(order.rider_id),
+        name: order.rider_name || order?.rider?.name || 'Rider',
+        rider_name: order.rider_name || order?.rider?.rider_name || order?.rider?.name || 'Rider',
+        active_orders: activeCount,
+        active_orders_count: activeCount,
+        rider_status: workStatus,
+        is_active: 1,
       });
-      if (!isAuto) toast.error(backendMsg);
-    } finally {
-      pendingAssignmentRef.current.delete(orderId);
-      setIsUpdating(prev => ({ ...prev, [orderId]: false }));
     }
+
+    return Array.from(byId.values());
   }, [riders]);
 
-  const autoAssignRiders = useCallback((allOrders) => {
-    // Frontend must not interpret workflow rules. Auto-assignment is disabled.
-    return;
-  }, [riders, assignRider]);
-
-  const fetchOrders = async () => {
+  const fetchOrders = useCallback(async () => {
     if (authLoading || !adminToken) return;
     try {
       setError(null);
-      const response = await apiClient.get('/api/admin/orders');
-      const data = response?.success ? response.data : (Array.isArray(response) ? response : []);
+      const response = await apiClient.get('/api/admin/orders', {
+        params: { page: 1, limit: 100 },
+      });
+      const payload = response?.success ? response.data : response;
+      const data = Array.isArray(payload?.items)
+        ? payload.items
+        : Array.isArray(payload)
+          ? payload
+          : [];
       setOrders(data);
     } catch (err) {
       console.error("Failed to fetch admin orders:", err);
@@ -102,17 +94,79 @@ const AdminOrders = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [adminToken, authLoading]);
+
+  const assignRider = useCallback(async (orderId, riderId, isAuto = false) => {
+    if (pendingAssignmentRef.current.has(orderId)) {
+      return;
+    }
+    pendingAssignmentRef.current.add(orderId);
+    try {
+      setIsUpdating((prev) => ({ ...prev, [orderId]: true }));
+      const response = await apiClient.put(`/api/admin/orders/${orderId}/assign-rider`, { rider_id: riderId });
+
+      if (response?.success) {
+        if (!isAuto) toast.success(`Rider assigned to #${orderId}`);
+        const snapshot = response?.data;
+        const matched = riders.find((r) => String(r.id) === String(riderId));
+        setOrders((prev) =>
+          prev.map((o) => {
+            if (o.order_id !== orderId) return o;
+            if (snapshot && typeof snapshot === 'object') {
+              return { ...o, ...snapshot, rider_id: snapshot.rider_id ?? riderId };
+            }
+            return {
+              ...o,
+              rider_id: riderId,
+              status: 'ASSIGNED',
+              rider_name: matched?.name,
+              rider_active_orders: matched?.active_orders_count ?? matched?.active_orders ?? 1,
+              rider: {
+                ...(o.rider || {}),
+                id: riderId,
+                riderId,
+                rider_id: riderId,
+                name: matched?.name,
+                rider_name: matched?.name,
+                active_orders: matched?.active_orders_count ?? matched?.active_orders ?? 1,
+                active_orders_count: matched?.active_orders_count ?? matched?.active_orders ?? 1,
+                rider_status: 'busy',
+              },
+            };
+          })
+        );
+        fetchRiders();
+        fetchOrders();
+      } else if (!isAuto) {
+        toast.error(response?.message || 'Failed to assign rider');
+      }
+    } catch (err) {
+      const backendMsg =
+        err?.response?.data?.message ||
+        err?.response?.data?.detail ||
+        err?.message ||
+        'Connection error during assignment';
+      console.error('[ADMIN_ASSIGN_SYNC] error:', { orderId, riderId, err });
+      if (!isAuto) toast.error(backendMsg);
+    } finally {
+      pendingAssignmentRef.current.delete(orderId);
+      setIsUpdating((prev) => ({ ...prev, [orderId]: false }));
+    }
+  }, [riders, fetchOrders]);
+
+  const autoAssignRiders = useCallback(() => {
+    return;
+  }, []);
 
   useEffect(() => {
+    if (authLoading || !adminToken) return undefined;
     fetchRiders();
     fetchOrders();
-    const interval = setInterval(fetchOrders, 15000);
+    const interval = setInterval(fetchOrders, 30000);
     return () => {
-      console.log('[ADMIN][ORDERS] Cleaning up intervals...');
       clearInterval(interval);
     };
-  }, []);
+  }, [adminToken, authLoading, fetchOrders]);
 
   useEffect(() => {
     if (authLoading || !adminToken) return undefined;
@@ -373,7 +427,13 @@ const AdminOrders = () => {
                       }
                     };
                     const riderName = order?.rider?.name || order.rider_name;
-                    const riderId = order?.rider?.id || order.rider_id || "";
+                    const riderId =
+                      order?.rider_id != null && order.rider_id !== ''
+                        ? String(order.rider_id)
+                        : order?.rider?.id != null
+                          ? String(order.rider.id)
+                          : '';
+                    const riderOptions = getRiderOptionsForOrder(order);
                     return (
                       <tr key={order.order_id} className="hover:bg-gray-50/50 transition-colors">
                         <td className="px-6 py-4 font-black text-gray-900 text-sm">#{order.order_id}</td>
@@ -391,9 +451,9 @@ const AdminOrders = () => {
                               {normalizeStatus(order.status).replace(/_/g, ' ')}
                             </span>
                             
-                            {normalizeStatus(order.status) === 'ORDER_PLACED' && (
+                            {normalizeStatus(order.status) === 'PLACED' && (
                               <button 
-                                onClick={() => handleUpdateStatus(order.order_id, 'RESTAURANT_CONFIRMED')}
+                                onClick={() => handleUpdateStatus(order.order_id, 'CONFIRMED')}
                                 disabled={isUpdating[order.order_id]}
                                 className="text-[9px] font-black uppercase tracking-widest text-[#f97316] hover:text-[#ea580c] transition-colors flex items-center gap-1"
                               >
@@ -401,9 +461,9 @@ const AdminOrders = () => {
                               </button>
                             )}
                             
-                            {normalizeStatus(order.status) === 'RESTAURANT_CONFIRMED' && (
+                            {normalizeStatus(order.status) === 'CONFIRMED' && (
                               <button 
-                                onClick={() => handleUpdateStatus(order.order_id, 'FOOD_READY')}
+                                onClick={() => handleUpdateStatus(order.order_id, 'READY')}
                                 disabled={isUpdating[order.order_id]}
                                 className="text-[9px] font-black uppercase tracking-widest text-green-500 hover:text-green-600 transition-colors flex items-center gap-1"
                               >
@@ -429,27 +489,34 @@ const AdminOrders = () => {
                                 </div>
                               )}
                               <select 
-                                value={riderId || ""}
+                                value={riderId}
                                 disabled={isUpdating[order.order_id]}
-                                onChange={(e) => assignRider(order.order_id, parseInt(e.target.value))}
+                                onChange={(e) => {
+                                  const next = e.target.value;
+                                  if (next) assignRider(order.order_id, parseInt(next, 10));
+                                }}
                                 className={`w-full pl-3 pr-8 py-1.5 bg-gray-50 border border-gray-200 rounded-xl text-[11px] font-black text-gray-600 outline-none focus:ring-2 focus:ring-[#f97316]/20 focus:border-[#f97316] appearance-none transition-all ${
                                   isUpdating[order.order_id] ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'
                                 }`}
                               >
                                 <option value="" disabled>Select Rider</option>
-                                {riders.filter(r => r.is_active && r.rider_status === 'available').map(r => {
-                                  const isBusy = (r.active_orders || 0) > 0;
+                                {riderOptions.map((r) => {
+                                  const key = String(r.id);
+                                  const isAssigned = key === riderId;
+                                  const isBusy =
+                                    r.rider_status === 'busy' ||
+                                    Number(r.active_orders_count ?? r.active_orders ?? 0) > 0;
                                   return (
-                                    <option 
-                                      key={r.id} 
-                                      value={r.id}
-                                      disabled={isBusy && r.id !== riderId}
+                                    <option
+                                      key={key}
+                                      value={key}
+                                      disabled={!isAssigned && isBusy}
                                     >
-                                      {r.name}{isBusy ? ` (Busy: ${r.active_orders})` : ' ✓ Available'}
+                                      {formatRiderLabel(r)}
                                     </option>
                                   );
                                 })}
-                                {riders.filter(r => r.is_active && r.rider_status === 'available').length === 0 && (
+                                {riderOptions.length === 0 && (
                                   <option value="" disabled>No available riders</option>
                                 )}
                               </select>
