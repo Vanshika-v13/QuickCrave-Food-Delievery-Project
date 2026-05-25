@@ -9,16 +9,22 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://www.gstatic.com/dialogflow-console/fast/df-messenger/prod/v1/themes/df-messenger-default.css">
+    <style>
+      df-messenger {
+        z-index: 9999;
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        --df-messenger-chat-background: #f3f6fd;
+        --df-messenger-message-user-background: #d3e3fd;
+        --df-messenger-message-bot-background: #fff;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
     <script src="https://www.gstatic.com/dialogflow-console/fast/messenger/bootstrap.js?v=1"></script>
-    <df-messenger
-      intent="WELCOME"
-      chat-title="QuickCrave Bot"
-      agent-id="972b0ef9-d1df-4ae5-af60-04b1783caa76"
-      language-code="en"
-    ></df-messenger>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

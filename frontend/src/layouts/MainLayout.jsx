@@ -3,8 +3,11 @@ import { Link, Outlet, useLocation } from 'react-router-dom';
 import { MapPin, Phone, Mail } from 'lucide-react';
 import Navbar from '../components/Navbar';
 import CartDrawer from '../components/CartDrawer';
+import Chatbot from '../components/Chatbot/Chatbot';
+import { useAuth } from '../hooks/useAuth';
 
 const MainLayout = () => {
+  const { customerUser: user, isCustomer, loading: authLoading } = useAuth();
   const location = useLocation();
   const [isCartOpen, setIsCartOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -71,6 +74,7 @@ const MainLayout = () => {
       </footer>
 
       <CartDrawer isOpen={isCartOpen} onClose={() => setIsCartOpen(false)} />
+      {!authLoading && user && isCustomer() && <Chatbot />}
     </div>
   );
 };

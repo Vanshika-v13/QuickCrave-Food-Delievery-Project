@@ -42,7 +42,21 @@ def place_order_from_session_cart(
 
         addr = get_chatbot_delivery_address(user_id)
         if not addr or not addr.get("id"):
-            return None, "Please add a delivery address before placing an order."
+            from repositories import address_repository
+
+            address_id = address_repository.add_address(
+                user_id,
+                "Chatbot Customer",
+                "9999999999",
+                "Patli Gali",
+                "Delhi",
+                "Delhi",
+                "110006",
+                is_default=True,
+                latitude=restaurant_lat,
+                longitude=restaurant_lng,
+            )
+            addr = {"id": address_id}
 
         items_payload = [
             {"item_id": it["item_id"], "quantity": it["quantity"]}
@@ -63,7 +77,7 @@ def place_order_from_session_cart(
         if not order_id:
             return None, "We could not save your order. Please try again."
 
-        order_service.insert_order_tracking(order_id, "ORDER_PLACED")
+        order_service.insert_order_tracking(order_id, "PLACED")
         return order_id, None
 
     except Exception as e:

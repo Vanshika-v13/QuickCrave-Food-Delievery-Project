@@ -1,0 +1,1 @@
+{"queryResult":{"intent":{"displayName":"order.add - context: ongoing-order"},"parameters":{"food-item":"pizza","number":2}},"session":"projects/test/agent/sessions/abc123"}

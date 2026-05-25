@@ -1,35 +1,71 @@
-# Dialogflow: `order.remove` training phrase fix
+# Dialogflow: `order.remove - context: ongoing-order`
 
-Apply in the [Dialogflow ES console](https://dialogflow.cloud.google.com/) for this agent. **Do not rename intents or change contexts.**
+Apply in the [Dialogflow ES console](https://dialogflow.cloud.google.com/) for agent `972b0ef9-d1df-4ae5-af60-04b1783caa76`. **Do not fix removal in the backend.**
 
-## `order.remove` — keep only explicit removal phrases
+## Intent setup
 
-**Include (examples):**
+- **Display name:** `order.remove - context: ongoing-order`
+- **Webhook:** enabled for this intent
+- **Static responses:** disabled / removed (webhook only)
+- **Input context:** `ongoing-order`
 
-- `remove @food-item`
-- `delete @food-item`
-- `cancel @food-item`
-- `remove 2 pizzas`
-- `delete vada pav`
-- `cancel biryani`
+## Parameters
 
-**Remove from training (these cause false matches):**
+| Parameter | Entity | Required |
+|-----------|--------|----------|
+| `food-item` | `@food-item` | **Yes** |
+| `number` | `@sys.number` | **No** |
 
-- Standalone food names: `vada pav`, `pizza`, `biryani`
-- Entity-only phrases: `@food-item` alone
-- Any phrase that is only a dish name with no `remove` / `delete` / `cancel`
+Annotate in training phrases where supported:
 
-## `order.remove` fulfillment
+- `[number]` → `@sys.number`
+- `[biryani]` / dish name → `@food-item`
 
-- Use **webhook** fulfillment for `order.remove - context: ongoing-order`
-- Remove static responses like `Removed @food-item` from the intent (the webhook returns `Removed …` only when keywords are present)
+## Training phrases (add all)
 
-## Webhook safety (already in `main.py`)
+```
+remove 1 biryani
+remove 2 biryani
+remove 3 biryani
+remove 1 vegetable biryani
+remove 2 vegetable biryani
+remove 1 mango lassi
+remove 2 mango lassi
+remove 1 pizza
+remove 2 pizza
+remove mango lassi
+remove 2 mango lassi
+remove 3 vada pav
+delete mango lassi
+delete 2 mango lassi
+```
 
-Even if Dialogflow still mis-matches, the webhook:
+## Expected webhook payload
 
-1. Re-routes food-only queries to `order.add`
-2. Blocks `remove_from_order` unless the user text contains `remove`, `delete`, or `cancel`
-3. Asks for quantity when a dish is named without a number
+For user input `remove 1 biryani`:
 
-No intent renames required.
+```json
+{
+  "queryResult": {
+    "intent": {
+      "displayName": "order.remove - context: ongoing-order"
+    },
+    "parameters": {
+      "food-item": "Vegetable Biryani",
+      "number": 1
+    }
+  }
+}
+```
+
+**Not** `Default Fallback Intent`.
+
+## Verify (with `ongoing-order` active)
+
+| User says | Expected intent |
+|-----------|-----------------|
+| `remove 1 biryani` | `order.remove - context: ongoing-order` |
+| `remove 1 mango lassi` | `order.remove - context: ongoing-order` |
+| `2 biryani` | `order.add - context: ongoing-order` |
+
+Backend uses **only** `queryResult.intent.displayName` — no `queryText` parsing.

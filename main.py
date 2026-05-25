@@ -51,7 +51,7 @@ import inspect
 ENABLE_NEARBY_FEATURE = False
 # --- Redis Integration (Hardened Startup) ---
 from services import redis_service
-from services.redis_service import init_redis, get_cache, set_cache
+from services.redis_service import init_redis, get_cache, set_cache, delete_cache
     
 import os
 logger.info(f"[DEBUG] MONGODB_DATABASE from env: {os.getenv('MONGODB_DATABASE', 'food_delivery')}")
@@ -66,10 +66,8 @@ last_payloads = {}  # Local process fallback ONLY to prevent local loop spam
 # Store last 3 points for moving average: {rider_id: [(lat, lng), ...]}
 rider_gps_history = defaultdict(list)
 
-# --- Dialogflow: session cart (session_id -> {item_id: {item_id, name, quantity, price}}) ---
-inprogress_orders = defaultdict(dict)
-# Pending orders: session_id -> {"item": "food_name"} waiting for quantity confirmation
-pending_orders: dict = {}
+# --- Dialogflow: temporary session carts (in-memory until order.complete) ---
+chat_sessions = {}  # session_id -> {item_id_str: {item_id, name, quantity, price}}
 chatbot_session_users = {}  # session_id -> (user_id, expires_at) or {user_id, email, expires_at}
 chatbot_user_last_link = {}  # user_id -> (canonical_session_id, expires_at)
 CHATBOT_SESSION_TTL = 86400
@@ -675,6 +673,7 @@ def clear_order_broadcast_cache(order_id: int, rider_id: int = None) -> None:
 @app.on_event("startup")
 async def startup_event():
     """Safe Startup Wrapper."""
+    logger.info("CART_MODE=DICT_ONLY")
     init_redis()
     try:
         logger.info("[SERVER] Initializing services...")
@@ -865,198 +864,6 @@ async def admin_ws(websocket: WebSocket):
             await websocket.close()
         except:
             pass
-
-# --- Dialogflow Webhook ---
-@app.post("/")
-async def handle_request(request: Request):
-    # =====================================================================
-    # PIPELINE STEP 1: Extract raw inputs — NO cart access, NO side effects
-    # =====================================================================
-    payload = await request.json()
-    query_result = payload.get("queryResult", {})
-    intent = query_result.get("intent", {}).get("displayName", "")
-    parameters = query_result.get("parameters", {}) or {}
-    output_contexts = query_result.get("outputContexts", []) or []
-    logger.info(f"[CHATBOT][RAW_OUTPUT_CONTEXTS] {output_contexts}")
-    logger.info(f"[CHATBOT][PARAMETERS_BEFORE] {parameters}")
-    parameters["_output_contexts"] = output_contexts
-    logger.info(f"[CHATBOT][PARAMETERS_AFTER] {parameters}")
-    query_text = query_result.get("queryText", "").lower().strip()
-
-    logger.info(f"[CHATBOT][PIPELINE] STEP1 raw_intent={intent!r} query={query_text!r}")
-
-    # =====================================================================
-    # PIPELINE STEP 2: Intent guard — food-only must NOT hit order.remove
-    # Without remove/delete/cancel keywords, route to order.add (quantity flow).
-    # =====================================================================
-    logger.info(f"[CHATBOT][INTENT_BEFORE] {intent}")
-    logger.info(f"[CHATBOT][QUERY] {query_text}")
-    
-    has_remove_words = _has_remove_keywords(query_text)
-    
-    if has_remove_words:
-        q_clean = _REMOVE_KEYWORDS_RE.sub("", query_text).strip()
-        matched_food = _chatbot_detect_food_in_text(q_clean)
-        if not matched_food:
-            matched_food = _chatbot_detect_food_in_text(query_text)
-    else:
-        matched_food = _chatbot_detect_food_in_text(query_text)
-
-    if not matched_food:
-        param_foods = _chatbot_extract_food_names(parameters)
-        if param_foods:
-            row = chatbot_service.get_food_item_by_name(param_foods[0])
-            matched_food = row["name"] if row else param_foods[0]
-
-    qty_detected = None
-    if matched_food:
-        qty_detected = _chatbot_explicit_remove_qty_for_food(query_text, matched_food)
-
-    logger.info(
-        f"[CHATBOT][REMOVE_FORCE_ROUTE] "
-        f"query='{query_text}' "
-        f"food_detected={matched_food} "
-        f"qty_detected={qty_detected}"
-    )
-
-    is_remove_intent = bool(intent and str(intent).startswith("order.remove"))
-
-    if matched_food and not has_remove_words:
-        prev_intent = intent
-        intent = _ADD_INTENT
-        parameters["food-item"] = [matched_food]
-        logger.info(
-            f"[CHATBOT][FORCE_ROUTE] Food '{matched_food}' without remove keyword — "
-            f"overriding intent '{prev_intent}' → order.add"
-        )
-    elif matched_food and has_remove_words and not is_remove_intent:
-        prev_intent = intent
-        intent = _REMOVE_INTENT
-        parameters["food-item"] = [matched_food]
-        logger.info(
-            f"[CHATBOT][FORCE_ROUTE] Food '{matched_food}' with remove keyword — "
-            f"overriding intent '{prev_intent}' → order.remove"
-        )
-    elif is_remove_intent and not has_remove_words:
-        prev_intent = intent
-        intent = _ADD_INTENT
-        if matched_food:
-            parameters["food-item"] = [matched_food]
-        logger.info(
-            f"[CHATBOT][FORCE_ROUTE] order.remove without remove/delete/cancel — "
-            f"overriding '{prev_intent}' → order.add"
-        )
-
-    # Route completion phrases even when Dialogflow mis-classifies the intent.
-    logger.info(f"[CHATBOT][COMPLETE_CHECK] query={query_text}")
-    
-    raw_contexts = query_result.get('outputContexts', []) or []
-    has_ongoing_order_context = any("ongoing-order" in ctx.get("name", "").lower() for ctx in raw_contexts)
-    
-    if _is_complete_order_phrase(query_text) and has_ongoing_order_context:
-        prev_intent = intent
-        intent = "order.complete - context: ongoing-order"
-        logger.info(f"[CHATBOT][INTENT_FORCED] {intent}")
-
-    logger.info(f"[CHATBOT][PIPELINE] STEP2 resolved_intent={intent!r}")
-
-    # =====================================================================
-    # PIPELINE STEP 3: Session extraction — still NO cart access
-    # =====================================================================
-    # IMPORTANT: Use a deterministic session_id key so add/remove mutate the
-    # same in-memory cart across turns. Prefer payload.session (authoritative),
-    # but migrate any in-memory state previously stored under a contexts-derived
-    # key to avoid "cosmetic" updates.
-    query_result = payload.get("queryResult", {})
-    session_full = payload.get("session", "")
-
-    session_id = session_full.split("/")[-1] if session_full else ""
-
-    if not session_id:
-        output_contexts = query_result.get("outputContexts", [])
-        if output_contexts:
-            ctx_name = output_contexts[0].get("name", "")
-            parts = ctx_name.split("/sessions/")
-            if len(parts) > 1:
-                session_id = parts[1].split("/")[0]
-
-    logger.info(f"[CHATBOT][SESSION_ID] {session_id}")
-
-    if not session_id:
-        session_id = "default-session"
-
-    session_id = _normalize_chatbot_session_id(session_id)
-
-    _consolidate_chatbot_session_state(session_id)
-
-    resolved_user, auth_source = _resolve_chatbot_auth_user(session_id, request, payload)
-    jwt_present = _chatbot_jwt_present(request, payload)
-    auth_decision = "ALLOW" if resolved_user else "BLOCK"
-
-    logger.info(
-        f"[CHAT_AUTH] jwt_present={jwt_present} dialogflow_session={session_id!r} "
-        f"resolved_user_id={resolved_user} auth_source={auth_source} decision={auth_decision}"
-    )
-    logger.info(f"[CHATBOT][PIPELINE] STEP3 session_id={session_id} resolved_user_id={resolved_user}")
-
-    # =====================================================================
-    # PIPELINE STEP 3.5: Pending quantity resolution
-    # If no food item was detected in this message, but the session has an
-    # item waiting for a quantity reply, route to add_to_order to complete it.
-    # =====================================================================
-    if not matched_food:
-        pending = pending_orders.get(_chatbot_session_key(session_id))
-        if pending and pending.get("item"):
-            logger.info(
-                f"[CHATBOT][PENDING_QTY] Session={session_id} has pending item "
-                f"'{pending['item']}' — routing to add_to_order for quantity resolution"
-            )
-            intent = _ADD_INTENT
-
-    # Pass raw query_text to handlers (remove safety + quantity detection)
-    parameters["_query_text"] = query_text
-    parameters["_has_remove_keywords"] = has_remove_words
-    parameters["_chatbot_user_id"] = resolved_user
-    parameters["_output_contexts"] = output_contexts
-    parameters["_resolved_intent"] = intent
-
-    # =====================================================================
-    # PIPELINE STEP 4: Route to ONE handler — cart logic lives ONLY inside
-    # each handler function below. Nothing after this point runs.
-    # =====================================================================
-    logger.info(f"[CHATBOT][INTENT] intent={intent}")
-    INTENT_HANDLER_MAP = {
-        'Default Welcome Intent': greeting_handler,
-        'Default Fallback Intent': fallback_handler,
-        'order.start': new_order_handler,
-        'new.order': new_order_handler,
-        'order.add - context: ongoing-order': add_to_order,
-        'order.remove - context: ongoing-order': remove_from_order,
-        'order.complete - context: ongoing-order': complete_order,
-        'track-order - context: ongoing-tracking': track_order,
-        'track.order': track_order,
-        'order.cancel': cancel_order_handler,
-    }
-
-    handler = INTENT_HANDLER_MAP.get(intent)
-    if handler is None:
-        logger.warning(f"[CHATBOT][PIPELINE] STEP4 No handler for intent={intent!r}")
-        return fallback_handler(parameters, session_id)
-
-    logger.info(f"[CHATBOT][PIPELINE] STEP4 dispatching → {handler.__name__}")
-
-    # Single dispatch point — this is the ONLY return from the webhook pipeline.
-    # No code runs after this; the handler's return value is the final response.
-    try:
-        if inspect.iscoroutinefunction(handler):
-            result = await handler(parameters, session_id)
-        else:
-            result = handler(parameters, session_id)
-    except Exception:
-        logger.exception("[CHATBOT][WEBHOOK_FATAL]")
-        raise
-    return _chatbot_finalize_webhook_response(result)
-
 
 class ChatbotLinkSession(BaseModel):
     session_id: str
@@ -2293,20 +2100,19 @@ def _migrate_chatbot_session_state(old_sid: str, new_sid: str) -> bool:
 
     migrated = False
 
-    if old_sid in inprogress_orders:
-        if new_sid not in inprogress_orders:
-            inprogress_orders[new_sid] = inprogress_orders.pop(old_sid)
+    old_cart = _get_cart(old_sid)
+    if old_cart:
+        new_cart = _get_cart(new_sid)
+        if not new_cart:
+            _set_cart(new_sid, old_cart)
         else:
-            for iid, item in inprogress_orders.pop(old_sid).items():
-                if iid in inprogress_orders[new_sid]:
-                    inprogress_orders[new_sid][iid]["quantity"] += item.get("quantity", 0)
+            for iid, item in old_cart.items():
+                if iid in new_cart:
+                    new_cart[iid]["quantity"] += item.get("quantity", 0)
                 else:
-                    inprogress_orders[new_sid][iid] = item
-        migrated = True
-
-    if old_sid in pending_orders:
-        if new_sid not in pending_orders:
-            pending_orders[new_sid] = pending_orders.pop(old_sid)
+                    new_cart[iid] = item
+            _set_cart(new_sid, new_cart)
+        _delete_cart(old_sid)
         migrated = True
 
     if old_sid in chatbot_session_users:
@@ -2326,14 +2132,6 @@ def _consolidate_chatbot_session_state(canonical_sid: str) -> None:
     for variant in _session_id_variants(canonical_sid):
         if variant != canonical_sid:
             _migrate_chatbot_session_state(variant, canonical_sid)
-
-    for sid in list(inprogress_orders.keys()):
-        if _normalize_chatbot_session_id(sid) == canonical_sid and sid != canonical_sid:
-            _migrate_chatbot_session_state(sid, canonical_sid)
-
-    for sid in list(pending_orders.keys()):
-        if _normalize_chatbot_session_id(sid) == canonical_sid and sid != canonical_sid:
-            _migrate_chatbot_session_state(sid, canonical_sid)
 
     for sid in list(chatbot_session_users.keys()):
         if _normalize_chatbot_session_id(sid) == canonical_sid and sid != canonical_sid:
@@ -2414,7 +2212,7 @@ def _fuzzy_resolve_chatbot_user(session_id: str) -> Optional[int]:
     return None
 
 
-def _read_session_mapped_user_id(session_id: str, *, allow_fuzzy: bool = True) -> Optional[int]:
+def _read_session_mapped_user_id(session_id: str, *, allow_fuzzy: bool = False) -> Optional[int]:
     """Read session→user mapping only. Never writes or links."""
     if not session_id:
         return None
@@ -2652,10 +2450,10 @@ def _chatbot_session_key(session_id: str) -> str:
 
 
 def _chatbot_extract_quantity(parameters: dict) -> Optional[int]:
-    """Return explicit quantity from parameters, or None — never default to 1."""
+    """Return explicit quantity from Dialogflow @number, or None — never default to 1."""
     if not parameters:
         return None
-    for key in ("number", "Number", "quantity", "amount"):
+    for key in ("number",):
         v = parameters.get(key)
         if v is None or v == "" or v == [] or v == [""]:
             continue
@@ -2664,36 +2462,67 @@ def _chatbot_extract_quantity(parameters: dict) -> Optional[int]:
                 if x is None or str(x).strip() == "":
                     continue
                 try:
-                    return max(1, int(float(x)))
+                    q = int(float(x))
+                    if q > 0:
+                        return q
                 except (TypeError, ValueError):
                     continue
         else:
             try:
-                return max(1, int(float(v)))
+                q = int(float(v))
+                if q > 0:
+                    return q
             except (TypeError, ValueError):
                 continue
     return None
+
+
+def _chatbot_extract_quantities(parameters: dict) -> list:
+    if not parameters:
+        return []
+    quantities = []
+    for key in ("number",):
+        v = parameters.get(key)
+        if v is None or v == "" or v == [] or v == [""]:
+            continue
+        if isinstance(v, list):
+            for x in v:
+                if x is None or str(x).strip() == "":
+                    continue
+                try:
+                    q = int(float(x))
+                    if q > 0:
+                        quantities.append(q)
+                except (TypeError, ValueError):
+                    continue
+            if quantities:
+                return quantities
+        else:
+            try:
+                q = int(float(v))
+                if q > 0:
+                    quantities.append(q)
+                    return quantities
+            except (TypeError, ValueError):
+                continue
+    return quantities
 
 
 def _chatbot_extract_food_names(parameters: dict) -> list:
     if not parameters:
         return []
     names = []
-    # Check all possible keys Dialogflow might use
-    for key in ("food-item", "food_item", "food", "Food", "dish", "item", "menu_item"):
-        v = parameters.get(key)
-        if v is None or v == "":
-            continue
-        if isinstance(v, list):
-            for x in v:
-                if x is not None and str(x).strip():
-                    names.append(str(x).strip())
-        else:
-            s = str(v).strip()
-            if s:
-                names.append(s)
-        if names:
-            break
+    v = parameters.get("food-item")
+    if v is None or v == "":
+        return names
+    if isinstance(v, list):
+        for x in v:
+            if x is not None and str(x).strip():
+                names.append(str(x).strip())
+    else:
+        s = str(v).strip()
+        if s:
+            names.append(s)
     return names
 
 
@@ -2720,671 +2549,212 @@ def _chatbot_extract_order_id(parameters: dict):
     return None
 
 
-_ORDER_ID_TEXT_RE = re.compile(
-    r"(?:order\s*(?:id|#|number)?\s*[:#]?\s*)(\d+)|#(\d+)|\btrack\s+order\s+(\d+)\b",
-    re.IGNORECASE,
-)
+
+def _get_cart(session_id):
+    cart = chat_sessions.get(session_id)
+    if isinstance(cart, dict):
+        return cart
+    return {}
 
 
-def _chatbot_extract_order_id_from_text(query_text: str) -> Optional[int]:
-    """Regex fallback when Dialogflow parameters omit the order id."""
-    q = (query_text or "").strip()
-    if not q:
-        return None
-    for m in _ORDER_ID_TEXT_RE.finditer(q):
-        for g in m.groups():
-            if g:
-                try:
-                    return int(g)
-                except (TypeError, ValueError):
-                    continue
-    m = re.search(r"\b(\d{3,})\b", q)
-    if m:
-        try:
-            return int(m.group(1))
-        except (TypeError, ValueError):
-            pass
-    return None
+def _set_cart(session_id, cart):
+    chat_sessions[session_id] = cart if isinstance(cart, dict) else {}
 
 
-def _chatbot_context_active(output_contexts, context_id: str) -> bool:
-    needle = f"/contexts/{context_id}"
-    for ctx in output_contexts or []:
-        name = ctx.get("name") or ""
-        if needle in name:
-            return True
-    return False
+def _delete_cart(session_id):
+    chat_sessions.pop(session_id, None)
 
 
-def _chatbot_require_ongoing_order(parameters) -> Optional[JSONResponse]:
-    contexts = parameters.get("_output_contexts", [])
-    logger.info(f"[CHATBOT][ONGOING_CONTEXT_CHECK] contexts={contexts}")
+def _chatbot_format_lines(lines: list) -> str:
+    """Display-only: one item per line with trailing commas (e.g. '2 Pizza,\\n1 Mango Lassi')."""
+    return ",\n".join(lines)
 
-    contexts = parameters.get("_output_contexts", []) or []
-    has_ongoing_order = any(
-        "ongoing-order" in (ctx.get("name", "").lower())
-        for ctx in contexts
+
+def _chatbot_format_cart_lines(cart: dict) -> str:
+    """Display-only: quantity before name from session cart."""
+    return _chatbot_format_lines(
+        [f"{item['quantity']} {item['name']}" for item in cart.values()]
     )
-
-    if not has_ongoing_order:
-        logger.info("[CHATBOT][ONGOING_CONTEXT_MISSING]")
-        return JSONResponse(
-            content={
-                "fulfillmentText": "Please start a new order first by saying 'New Order'."
-            }
-        )
-    return None
-
-
-def _chatbot_friendly_track_status(status: str) -> str:
-    s = (status or "").strip().upper()
-    if s == "CONFIRMED":
-        return "Preparing"
-    if s == "DELIVERED":
-        return "Delivered"
-    return s.replace("_", " ").title()
-
-
-def _chatbot_cart_summary(cart: dict) -> str:
-    name_qty = {item["name"]: item["quantity"] for item in cart.values()}
-    return generic_helper.get_str_from_food_dict(name_qty)
-
-
-_REMOVE_KEYWORDS_RE = re.compile(r"\b(remove|delete|cancel)\b", re.IGNORECASE)
-_COMPLETE_ORDER_PHRASES_RE = re.compile(
-    r"\b(?:complete\s+order|place\s+order|finish\s+order|"
-    r"that'?s\s+it|that\s+is\s+it|done\s+ordering|checkout|confirm\s+order|nope|done|no|finish|that'?s\s+all)\b",
-    re.IGNORECASE,
-)
-_ADD_INTENT = "order.add - context: ongoing-order"
-_REMOVE_INTENT = "order.remove - context: ongoing-order"
-
-
-def _is_complete_order_phrase(query_text: str) -> bool:
-    return bool(_COMPLETE_ORDER_PHRASES_RE.search(query_text or ""))
-
-
-def _has_remove_keywords(query_text: str) -> bool:
-    return bool(_REMOVE_KEYWORDS_RE.search(query_text or ""))
-
-
-def _food_name_regex_pattern(food_name: str) -> str:
-    """Build a flexible regex for multi-word menu names (e.g. vada pav)."""
-    parts = [re.escape(p) for p in (food_name or "").lower().split() if p]
-    return r"\s+".join(parts) if parts else ""
-
-
-def _chatbot_find_remove_qty_in_text(text: str, food_re: str) -> Optional[int]:
-    """Extract a quantity tied to a food name within a text fragment."""
-    if not text or not food_re:
-        return None
-    patterns = (
-        rf"\b(\d+)\s+(?:\w+\s+)*?{food_re}\b",
-        rf"\b{food_re}\s*x\s*(\d+)\b",
-        rf"\b{food_re}\s+(\d+)\b",
-    )
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return max(1, int(m.group(1)))
-    return None
-
-
-def _chatbot_explicit_remove_qty_for_food(query_text: str, food_name: str) -> Optional[int]:
-    """
-    Return quantity to subtract when the user explicitly typed a number for this dish.
-    Return None when no number is tied to this food → caller must FULL DELETE the line item.
-    Uses raw query text only (never Dialogflow number[] defaults).
-    """
-    q = (query_text or "").lower().strip()
-    food_re = _food_name_regex_pattern(food_name)
-    if not q or not food_re:
-        return None
-
-    if not re.search(r"\b\d+\b", q):
-        return None
-
-    q_clean = _REMOVE_KEYWORDS_RE.sub(" ", q).strip()
-
-    for segment in re.split(r"\s+and\s+", q_clean):
-        segment = segment.strip()
-        if not re.search(food_re, segment) and not re.search(food_re, q_clean):
-            continue
-        qty = _chatbot_find_remove_qty_in_text(segment, food_re)
-        if qty is None:
-            qty = _chatbot_find_remove_qty_in_text(q_clean, food_re)
-        if qty is not None:
-            return qty
-
-    return None
-
-
-def _chatbot_cart_name_qty_snapshot(cart: dict) -> dict:
-    """Compact {canonical_name: qty} view for debug logs."""
-    snap = {}
-    for it in (cart or {}).values():
-        name = (it.get("name") or "").strip()
-        if name:
-            snap[name] = int(it.get("quantity") or 0)
-    return snap
-
-
-def _chatbot_clean_fulfillment_text(text: str) -> str:
-    """
-    Strip merged Dialogflow agent + webhook text (e.g. 'SamosaRemoved Samosa'
-    or 'Removed SamosaRemoved Samosa') down to a single clean bot message.
-    Only runs when duplicate 'removed' fragments are detected.
-    """
-    text = (text or "").strip()
-    if not text:
-        return text
-
-    needle = "removed "
-    lower = text.lower()
-    if lower.count(needle) < 2:
-        return text
-
-    first = lower.find(needle)
-    last = lower.rfind(needle)
-    if last > first:
-        return text[last:].strip()
-
-    prefix = text[:first].strip()
-    if prefix and not prefix.lower().startswith("removed"):
-        return text[first:].strip()
-
-    return text
-
-
-def _chatbot_fulfillment_response(message: str) -> JSONResponse:
-    """Standard Dialogflow webhook payload; fulfillmentMessages override agent text."""
-    clean = _chatbot_clean_fulfillment_text(message)
-    logger.info("BOT RESPONSE: %s", clean)
-    return JSONResponse(
-        content={
-            "fulfillmentText": clean,
-            "fulfillmentMessages": [{"text": {"text": [clean]}}],
-        }
-    )
-
-
-def _chatbot_finalize_webhook_response(result) -> JSONResponse:
-    """Normalize handler output to a single clean fulfillment payload."""
-    raw = ""
-    if isinstance(result, JSONResponse):
-        try:
-            raw = json.loads(result.body.decode("utf-8")).get("fulfillmentText", "")
-        except Exception:
-            raw = ""
-    elif isinstance(result, dict):
-        raw = result.get("fulfillmentText", "")
-    elif isinstance(result, str):
-        raw = result
-
-    clean = _chatbot_clean_fulfillment_text(raw) or (
-        "Something went wrong. Please try again."
-    )
-    return _chatbot_fulfillment_response(clean)
-
-
-def _chatbot_remove_label_to_message(label: str) -> str:
-    """One removal line — never double-prefix 'Removed'."""
-    label = (label or "").strip()
-    if not label:
-        return ""
-    if label.lower().startswith("removed "):
-        return label
-    return f"Removed {label}"
-
-
-def _chatbot_remove_fulfillment_text(removed_labels: list[str], final_cart: dict) -> str:
-    """Build remove response from final persisted cart only."""
-    messages = [_chatbot_remove_label_to_message(label) for label in removed_labels]
-    messages = [m for m in messages if m]
-    if not messages:
-        return "I did not catch which dish to remove. Please name the item."
-    if len(messages) == 1:
-        text = messages[0]
-    else:
-        text = ". ".join(messages)
-    if not final_cart:
-        return f"{text}. Your order is empty now."
-    return f"{text}. Remaining order: {_chatbot_cart_summary(final_cart)}"
-
-
-def _chatbot_detect_food_in_text(query_text: str) -> Optional[str]:
-    """Return canonical menu name when query_text mentions a dish (DB-backed)."""
-    q = re.sub(r"^\d+\s+", "", (query_text or "").lower()).strip()
-    if not q:
-        return None
-    row = chatbot_service.get_food_item_by_name(q)
-    if row:
-        return row["name"]
-    try:
-        menu = food_service.get_food_items() or []
-    except Exception:
-        menu = []
-    for item in sorted(menu, key=lambda i: len(i.get("name") or ""), reverse=True):
-        name = (item.get("name") or "").strip()
-        if name and name.lower() in q:
-            return name
-    return None
-
-
-def _chatbot_detect_all_foods_in_text(query_text: str) -> list:
-    """Return all menu items mentioned in query_text (longest names first)."""
-    q = (query_text or "").lower().strip()
-    if not q:
-        return []
-    try:
-        menu = food_service.get_food_items() or []
-    except Exception:
-        menu = []
-    found = []
-    seen = set()
-    for item in sorted(menu, key=lambda i: len(i.get("name") or ""), reverse=True):
-        name = (item.get("name") or "").strip()
-        key = name.lower()
-        if name and key in q and key not in seen:
-            found.append(name)
-            seen.add(key)
-    return found
-
-
-_CHATBOT_QTY_ITEMS_CLARIFICATION = (
-    "Please specify the quantity for food items. Example: 2 pizzas, 1 mango lassi."
-)
-
-
-def _quantity_clarification_message(food_name: str = None) -> str:
-    return _CHATBOT_QTY_ITEMS_CLARIFICATION
-
-
-def _has_explicit_quantity(parameters: dict, query_text: str = "") -> bool:
-    """
-    True only when the user message contains an explicit digit.
-    Dialogflow number[] is not trusted alone (often defaults to [1]).
-    """
-    return bool(re.search(r"\b\d+\b", query_text or ""))
-
-
-def _chatbot_split_order_clauses(query_text: str) -> list:
-    """Split multi-item order text on 'and' / commas."""
-    q = (query_text or "").lower().strip()
-    if not q:
-        return []
-    q = re.sub(
-        r"^(?:please\s+)?(?:add|order|get|i\s+want|i'?d\s+like)\s+",
-        "",
-        q,
-        flags=re.IGNORECASE,
-    ).strip()
-    if not q:
-        return []
-    parts = re.split(r"\s+and\s+|,", q)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _chatbot_qty_for_clause(clause: str) -> Optional[int]:
-    """Return explicit quantity from a clause, or None if none stated."""
-    m = re.search(r"\b(\d+)\b", clause or "")
-    if m:
-        return max(1, int(m.group(1)))
-    return None
-
-
-def _chatbot_parse_add_items(query_text: str, parameters: dict) -> list:
-    """
-    Parse one or more dishes from user text.
-    Returns [{"name": canonical_name, "qty": int|None}, ...].
-    qty=None means the user did not specify a quantity for that item.
-    """
-    clauses = _chatbot_split_order_clauses(query_text)
-    multi_clause = len(clauses) > 1
-
-    if multi_clause:
-        parsed = []
-        for clause in clauses:
-            food = _chatbot_detect_food_in_text(clause)
-            if not food:
-                continue
-            parsed.append({"name": food, "qty": _chatbot_qty_for_clause(clause)})
-        if parsed:
-            return parsed
-
-    all_foods = _chatbot_detect_all_foods_in_text(query_text)
-    if len(all_foods) > 1:
-        parsed = []
-        for food in all_foods:
-            food_re = _food_name_regex_pattern(food)
-            qty = _chatbot_find_remove_qty_in_text(query_text, food_re)
-            parsed.append({"name": food, "qty": qty})
-        return parsed
-
-    foods = _chatbot_extract_food_names(parameters)
-    if not foods:
-        detected = _chatbot_detect_food_in_text(query_text)
-        if detected:
-            foods = [detected]
-
-    if not foods:
-        return []
-
-    if len(foods) > 1:
-        parsed = []
-        for fname in foods:
-            row = chatbot_service.get_food_item_by_name(fname)
-            canonical = row["name"] if row else fname.strip()
-            food_re = _food_name_regex_pattern(canonical)
-            qty = _chatbot_find_remove_qty_in_text(query_text, food_re)
-            if qty is None:
-                qty = _chatbot_find_remove_qty_in_text(
-                    query_text, _food_name_regex_pattern(fname)
-                )
-            if qty is None and _has_explicit_quantity(parameters, query_text):
-                qty = _chatbot_extract_quantity(parameters)
-            parsed.append({"name": canonical, "qty": qty})
-        return parsed
-
-    row = chatbot_service.get_food_item_by_name(foods[0])
-    canonical = row["name"] if row else foods[0].strip()
-    qty = _chatbot_qty_for_clause(query_text)
-    if qty is None and _has_explicit_quantity(parameters, query_text):
-        qty = _chatbot_extract_quantity(parameters)
-    return [{"name": canonical, "qty": qty}]
-
-
-def _chatbot_add_parsed_items_to_cart(cart: dict, parsed_items: list) -> tuple:
-    """Apply parsed items to cart. Returns (added_labels, unavailable_name)."""
-    added = []
-    for entry in parsed_items:
-        if entry.get("qty") is None:
-            continue
-        row = chatbot_service.get_food_item_by_name(entry["name"])
-        if not row:
-            return added, entry["name"]
-        qty = max(1, int(entry["qty"]))
-        iid = row["item_id"]
-        if iid in cart:
-            cart[iid]["quantity"] += qty
-        else:
-            cart[iid] = {
-                "item_id": iid,
-                "name": row["name"],
-                "quantity": qty,
-                "price": float(row["price"]),
-            }
-        added.append(f"{qty} {row['name']}")
-    return added, None
-
-
-def _chatbot_user_from_context(pre_resolved_user_id: int = None, session_id: str = None, parameters: dict = None):
-    """
-    Use user resolved once at webhook entry. Handlers must not re-run auth checks.
-    """
-    if pre_resolved_user_id:
-        return pre_resolved_user_id, None
-
-    if session_id and parameters:
-        contexts = parameters.get("_output_contexts", [])
-        has_ongoing_order = any(
-            "ongoing-order" in (ctx.get("name", "").lower())
-            for ctx in contexts
-        )
-        if has_ongoing_order:
-            logger.info(f"[CHATBOT][AUTH_BYPASS] session_id={session_id} ongoing_order_context=True")
-            return None, None
-
-    logger.warning("[CHAT_AUTH] mapped_user=None — all auth checks failed at webhook")
-    return None, "Please log in on the website before placing an order through chat."
 
 
 def save_to_db(session_cart: dict, user_id: int):
     """Create a production order from the chatbot session cart (delegates to chatbot_service)."""
     logger.info(f"[CHATBOT][SAVE_TO_DB] user_id={user_id} cart={session_cart}")
-    result = chatbot_service.place_order_from_session_cart(
+    return chatbot_service.place_order_from_session_cart(
         user_id, session_cart, RESTAURANT_LAT, RESTAURANT_LNG
     )
-    logger.info(f"[CHATBOT][SAVE_TO_DB_RESULT] result={result}")
-    return result
 
 
 # --- Dialogflow Handlers ---
 
-
-
-_CHATBOT_START_ORDER_MSG = "Please start a new order first by saying 'New Order'."
-_CHATBOT_TRACK_ORDER_ID_MSG = "Please provide your order ID to track your order."
-
-
 def greeting_handler(parameters, session_id):
     return JSONResponse(
-        content={"fulfillmentText": "Hi! You can say 'New Order' or 'Track Order'."}
+        content={
+            "fulfillmentText": (
+                "Greetings! How can I assist?\n\n"
+                'You can say "New Order" or "Track Order"'
+            )
+        }
     )
-
 
 def fallback_handler(parameters, session_id):
     return JSONResponse(
         content={
             "fulfillmentText": (
-                "Sorry, I didn't understand that. You can say 'New Order' or 'Track Order'."
+                "Sorry, I didn't understand that.\n"
+                "You can say things like:\n"
+                "1 pizza\n"
+                "2 samosa\n"
+                "remove pizza"
             )
         }
     )
 
 def new_order_handler(parameters, session_id):
     sid = _chatbot_session_key(session_id)
-    inprogress_orders[sid] = {}
-    pending_orders.pop(sid, None)
+    _set_cart(sid, {})
     text = (
-        "Starting new order. Specify food items and quantities.\n"
-        "For example: 'I would like to order 2 pizzas and 1 mango lassi'.\n"
-        "Menu: Pav Bhaji, Chole Bhature, Pizza, Mango Lassi, Masala Dosa, Biryani, Vada Pav, Rava Dosa, Samosa."
+        "Great 👍 Let's start your order.\n\n"
+        "You can say like:\n\n"
+        "1 pizza\n"
+        "2 vada pav\n"
+        "3 mango lassi"
     )
-    return JSONResponse(content={"fulfillmentText": text})
-
-def _chatbot_add_pending_item(cart: dict, food_name: str, qty: int) -> tuple:
-    row = chatbot_service.get_food_item_by_name(food_name)
-    if not row:
-        return None, food_name
-    qty = max(1, int(qty))
-    iid = row["item_id"]
-    if iid in cart:
-        cart[iid]["quantity"] += qty
-    else:
-        cart[iid] = {
-            "item_id": iid,
-            "name": row["name"],
-            "quantity": qty,
-            "price": float(row["price"]),
-        }
-    return f"{qty} {row['name']}", None
-
-
-def _chatbot_cart_fulfillment_summary(cart: dict) -> str:
-    if not cart:
-        return "Your order is empty."
-    summary = _chatbot_cart_summary(cart)
-    return f"So far you have: {summary}. Do you need anything else?"
-
+    return JSONResponse(content={
+        "fulfillmentText": text,
+        "outputContexts": [
+            {
+                "name": f"{session_id}/contexts/ongoing-order",
+                "lifespanCount": 10
+            }
+        ]
+    })
 
 def add_to_order(parameters, session_id):
-    logger.info("[CHATBOT][ADD_TO_ORDER_ENTERED]")
     try:
-        logger.info(f"[CHATBOT][ADD_PARAMS] {parameters}")
-        blocked = _chatbot_require_ongoing_order(parameters)
-        if blocked:
-            return blocked
-
         sid = _chatbot_session_key(session_id)
-        if sid not in inprogress_orders:
-            logger.info(
-                f"[CHATBOT][ONGOING_ORDER_FAIL] "
-                f"session_id={session_id} "
-                f"contexts={parameters.get('_output_contexts')} "
-                f"cart_exists={bool(inprogress_orders.get(sid))}"
-            )
-            inprogress_orders[sid] = {}
-
-        query_text = parameters.get("_query_text", "")
-        cart = inprogress_orders[sid]
-
-        pending = pending_orders.get(sid)
-        if pending and pending.get("item"):
-            qty = _chatbot_qty_for_clause(query_text)
-            if qty is None and _has_explicit_quantity(parameters, query_text):
-                qty = _chatbot_extract_quantity(parameters)
-            if qty is None:
-                return JSONResponse(
-                    content={
-                        "fulfillmentText": _quantity_clarification_message(pending["item"])
-                    }
-                )
-            label, unavailable = _chatbot_add_pending_item(cart, pending["item"], qty)
-            pending_orders.pop(sid, None)
-            if unavailable:
-                return JSONResponse(
-                    content={
-                        "fulfillmentText": f"Sorry, {unavailable} is not available right now."
-                    }
-                )
+        cart = _get_cart(sid)
+        
+        foods = _chatbot_extract_food_names(parameters)
+        if not foods:
+            return JSONResponse(content={"fulfillmentText": "Please specify a food item."})
+            
+        quantities = _chatbot_extract_quantities(parameters)
+        
+        if len(quantities) < len(foods):
+            canonical_names = []
+            for food in foods:
+                row = chatbot_service.get_food_item_by_name(food)
+                canonical = row["name"] if row else food
+                canonical_names.append(canonical)
+            
             return JSONResponse(
                 content={
-                    "fulfillmentText": f"Added {label}. {_chatbot_cart_fulfillment_summary(cart)}"
+                    "fulfillmentText": (
+                        f"Please specify quantity for {canonical_names[0]}.\n\n"
+                        f"Example: 1 {canonical_names[0]} or 2 {canonical_names[0]}."
+                    )
                 }
             )
+            
+        added_msgs = []
+        for food, qty in zip(foods, quantities):
+            row = chatbot_service.get_food_item_by_name(food)
+            if not row:
+                continue
+            canonical = row["name"]
+            iid = row["item_id"]
+            price = float(row["price"])
+            
+            qty = int(qty)
+            iid_str = str(iid)
+            
+            if iid_str in cart:
+                cart[iid_str]["quantity"] += qty
+            else:
+                cart[iid_str] = {"item_id": iid, "name": canonical, "quantity": qty, "price": price}
+                
+            added_msgs.append(f"{qty} {canonical}")
+            
+        if not added_msgs:
+            return JSONResponse(content={"fulfillmentText": "I couldn't find that item on the menu."})
+            
+        _set_cart(sid, cart)
 
-        parsed = _chatbot_parse_add_items(query_text, parameters)
-        if not parsed:
-            return JSONResponse(content={"fulfillmentText": "Please specify a food item."})
-
-        missing_qty = [p for p in parsed if p.get("qty") is None]
-        if missing_qty:
-            if len(missing_qty) == 1 and len(parsed) == 1:
-                pending_orders[sid] = {"item": missing_qty[0]["name"]}
-                return JSONResponse(
-                    content={
-                        "fulfillmentText": _quantity_clarification_message(missing_qty[0]["name"])
-                    }
-                )
-            return JSONResponse(
-                content={"fulfillmentText": _quantity_clarification_message()}
-            )
-
-        added, unavailable = _chatbot_add_parsed_items_to_cart(cart, parsed)
-        if unavailable:
+        if len(added_msgs) == 1:
+            line = added_msgs[0]
+            qty_str, name = line.split(" ", 1)
             return JSONResponse(
                 content={
-                    "fulfillmentText": f"Sorry, {unavailable} is not available right now."
+                    "fulfillmentText": (
+                        f"So far you have added {qty_str} {name} to your order.\n\nAnything else?"
+                    )
                 }
             )
-        if not added:
-            return JSONResponse(content={"fulfillmentText": "Please specify a food item."})
-
-        return JSONResponse(content={"fulfillmentText": _chatbot_cart_fulfillment_summary(cart)})
-
-    except Exception:
-        logger.exception("[CHATBOT] add_to_order")
+        order_lines = _chatbot_format_lines(added_msgs)
         return JSONResponse(
             content={
                 "fulfillmentText": (
-                    "Something went wrong updating your order. Please try again in a moment."
+                    f"Got it 👍 Your order includes:\n\n{order_lines}\n\nAnything else?"
                 )
             }
         )
+            
+    except Exception as e:
+        logger.exception("[CHATBOT] add_to_order")
+        return JSONResponse(content={"fulfillmentText": "Something went wrong updating your order."})
 
 def remove_from_order(parameters, session_id):
     try:
-        if not parameters.get("_has_remove_keywords"):
-            logger.info(
-                "[CHATBOT][REMOVE] blocked — no remove/delete/cancel in user text; routing to add"
-            )
-            return add_to_order(parameters, session_id)
-
-        blocked = _chatbot_require_ongoing_order(parameters)
-        if blocked:
-            return blocked
-
         sid = _chatbot_session_key(session_id)
-        cart = inprogress_orders.get(sid)
+        cart = _get_cart(sid)
         if not cart:
-            return JSONResponse(content={"fulfillmentText": "Your order is empty."})
-
-        query_text = parameters.get("_query_text", "")
+            return JSONResponse(content={"fulfillmentText": "Your cart is currently empty."})
+            
         foods = _chatbot_extract_food_names(parameters)
         if not foods:
-            foods = _chatbot_detect_all_foods_in_text(query_text)
-        if not foods:
-            detected = _chatbot_detect_food_in_text(query_text)
-            if detected:
-                foods = [detected]
-
-        if not foods:
-            return JSONResponse(
-                content={
-                    "fulfillmentText": "I did not catch which dish to remove. Please name the item."
-                }
-            )
-
-        removed_labels = []
-        for food in foods:
+            return JSONResponse(content={"fulfillmentText": "I did not catch which dish to remove."})
+            
+        quantities = _chatbot_extract_quantities(parameters)
+        
+        removed_msgs = []
+        for i, food in enumerate(foods):
             row = chatbot_service.get_food_item_by_name(food)
             canonical = row["name"] if row else food.strip()
-            iid = row["item_id"] if row else None
-
-            if not iid or iid not in cart:
-                for k, v in cart.items():
-                    if (v.get("name") or "").lower() == food.lower():
-                        iid = k
-                        canonical = v["name"]
-                        break
-
-            if not iid or iid not in cart:
-                removed_labels.append(f"{canonical} is not in your current order")
-                continue
-
-            qty_remove = _chatbot_explicit_remove_qty_for_food(query_text, canonical)
-            logger.info(f"[CHATBOT][REMOVE] item={canonical} qty_remove={qty_remove}")
+            
+            existing_key = next((k for k, v in cart.items() if v["name"] == canonical), None)
+            if not existing_key:
+                return JSONResponse(content={"fulfillmentText": "That item is not in your order."})
+                
+            qty_remove = quantities[i] if i < len(quantities) else None
+            
             if qty_remove is None:
-                del cart[iid]
-                removed_labels.append(f"{canonical} from your order")
+                del cart[existing_key]
+                removed_msgs.append(f"Removed {canonical} completely.")
             else:
-                cart[iid]["quantity"] -= qty_remove
-                if cart[iid]["quantity"] <= 0:
-                    del cart[iid]
-                    removed_labels.append(f"{qty_remove} {canonical}")
+                cart[existing_key]["quantity"] -= qty_remove
+                if cart[existing_key]["quantity"] <= 0:
+                    del cart[existing_key]
+                    removed_msgs.append(f"Removed {canonical} completely.")
                 else:
-                    removed_labels.append(f"{qty_remove} {canonical}")
+                    removed_msgs.append(f"Removed {qty_remove} {canonical}.")
 
-        if not removed_labels:
-            return JSONResponse(
-                content={
-                    "fulfillmentText": "I did not catch which dish to remove. Please name the item."
-                }
-            )
+        _set_cart(sid, cart)
 
-        if all("is not in your current order" in label for label in removed_labels):
-            return {"fulfillmentText": removed_labels[0] + "."}
-
-        success_labels = [
-            label for label in removed_labels if "is not in your current order" not in label
-        ]
-        text = _chatbot_remove_fulfillment_text(success_labels, cart)
-
-        logger.info(
-            f"[CHATBOT][REMOVE] session={sid} cart={_chatbot_cart_name_qty_snapshot(cart)}"
-        )
-        return {"fulfillmentText": text}
-
-    except Exception:
-        logger.exception("[CHATBOT] remove_from_order")
+        removed_text = "\n".join(removed_msgs)
+        if not cart:
+            remaining = "Your cart is empty."
+        else:
+            remaining = _chatbot_format_cart_lines(cart)
         return JSONResponse(
             content={
-                "fulfillmentText": (
-                    "Something went wrong updating your order. Please try again in a moment."
-                )
+                "fulfillmentText": f"{removed_text}\n\nRemaining order:\n\n{remaining}"
             }
         )
+            
+    except Exception:
+        logger.exception("[CHATBOT] remove_from_order")
+        return JSONResponse(content={"fulfillmentText": "Something went wrong updating your order."})
 
 async def _chatbot_push_order_update_safe(order_id: int) -> None:
     try:
@@ -3394,100 +2764,81 @@ async def _chatbot_push_order_update_safe(order_id: int) -> None:
             f"[CHATBOT] push_order_update non-critical failure for order_id={order_id}: {ws_err}"
         )
 
-
 async def complete_order(parameters, session_id):
-    logger.info("[CHATBOT] complete_order ENTERED")
     try:
-        blocked = _chatbot_require_ongoing_order(parameters)
-        if blocked:
-            logger.exception("[CHATBOT][COMPLETE] FAILURE")
-            return blocked
-
         sid = _chatbot_session_key(session_id)
-        user_id, login_err = _chatbot_user_from_context(parameters.get("_chatbot_user_id"), session_id, parameters)
-        if login_err:
-            logger.exception("[CHATBOT][COMPLETE] FAILURE")
-            return JSONResponse(content={"fulfillmentText": login_err})
-
-        live_cart = inprogress_orders.get(sid)
-        if not live_cart:
-            logger.exception("[CHATBOT][COMPLETE] FAILURE")
-            return JSONResponse(
-                content={
-                    "fulfillmentText": "Your order is empty"
-                }
-            )
-
-        cart_snapshot = {k: dict(v) for k, v in live_cart.items()}
-        order_id, err = save_to_db(cart_snapshot, user_id)
+        cart = _get_cart(sid)
         
-        logger.info(f"[CHATBOT][COMPLETE] order_id={order_id} err={err}")
+        if not cart:
+            return JSONResponse(content={"fulfillmentText": "Your cart is currently empty."})
 
-        if err or not order_id or order_id == 0:
-            logger.exception("[CHATBOT][COMPLETE] FAILURE")
-            return JSONResponse(
-                content={
-                    "fulfillmentText": "Sorry, I couldn't place your order right now. Please try again."
-                }
-            )
+        mapped_user = _read_session_mapped_user_id(sid, allow_fuzzy=True)
+        user_id = mapped_user if mapped_user else 1
 
-        total = sum(v["quantity"] * v["price"] for v in cart_snapshot.values())
+        order_id, err = save_to_db(cart, user_id)
+        if err or not order_id:
+            msg = err or "Sorry, I couldn't place your order right now."
+            return JSONResponse(content={"fulfillmentText": msg})
 
-        live_cart.clear()
-        pending_orders.pop(sid, None)
+        _delete_cart(sid)
+
+        order_row = order_service.get_order_by_id(order_id)
+        total = int(order_row["total_amount"]) if order_row and order_row.get("total_amount") is not None else 0
+
+        await _chatbot_push_order_update_safe(order_id)
+
+        items_str = _chatbot_format_cart_lines(cart)
 
         text = (
-            f"So far your order was: {_chatbot_cart_summary(cart_snapshot)}.\n\n"
-            f"Your order has been placed successfully!\n"
+            "🎉 Order placed successfully!\n\n"
+            "Your order is:\n\n"
+            f"{items_str}\n\n"
+            f"Total Amount: ₹{int(total)}\n"
             f"Order ID: #{order_id}\n"
-            f"Total Amount: ₹{int(total)}\n\n"
-            f"You can pay at delivery.\n"
-            f"Use 'Track Order' with your order ID to check status."
+            "Status: PLACED\n"
+            "You can track your order using this ID."
         )
 
-        asyncio.create_task(_chatbot_push_order_update_safe(order_id))
-
-        logger.info(f"[CHATBOT][COMPLETE] SUCCESS order_id={order_id}")
-        return JSONResponse(content={"fulfillmentText": text})
-
-    except Exception:
+        return JSONResponse(content={
+            "fulfillmentText": text,
+            "fulfillmentMessages": [{"text": {"text": [text]}}],
+            "orderId": f"#{order_id}",
+            "total": int(total),
+            "success": True
+        })
+    except Exception as e:
         logger.exception("[CHATBOT] complete_order")
-        logger.exception("[CHATBOT][COMPLETE] FAILURE")
-        return JSONResponse(
-            content={
-                "fulfillmentText": (
-                    "Something went wrong completing your order. Please try again later."
-                )
-            }
-        )
+        return JSONResponse(content={"fulfillmentText": "Something went wrong completing your order."})
+
+def _chatbot_track_status_text(order_id: int, status: str) -> str:
+    s = (status or "").strip().upper()
+    if s in ("DELIVERED", "DELIVERED_SUCCESS"):
+        return f"Your order #{order_id} has been DELIVERED ✅"
+    if s in ("ON_WAY", "OUT_FOR_DELIVERY", "ON_THE_WAY", "PICKED_UP", "ARRIVING"):
+        return f"Your order #{order_id} is currently OUT FOR DELIVERY 🚴"
+    return f"Your order #{order_id} is currently PACKING 🍳"
 
 
 def track_order(parameters, session_id):
     try:
-        user_id, login_err = _chatbot_user_from_context(parameters.get("_chatbot_user_id"), session_id, parameters)
-        if login_err:
-            return JSONResponse(
-                content={"fulfillmentText": "Please log in on the website to track your order."}
-            )
+        sid = _chatbot_session_key(session_id)
+        mapped_user = _read_session_mapped_user_id(sid, allow_fuzzy=True)
+        user_id = mapped_user if mapped_user else 1
 
-        query_text = parameters.get("_query_text", "")
         oid = _chatbot_extract_order_id(parameters)
-        if oid is None:
-            oid = _chatbot_extract_order_id_from_text(query_text)
 
         if oid is None:
-            return JSONResponse(content={"fulfillmentText": _CHATBOT_TRACK_ORDER_ID_MSG})
+            return JSONResponse(
+                content={"fulfillmentText": "Sure! Could you enter your order ID?"}
+            )
 
         status = chatbot_service.get_order_status_for_user(oid, user_id)
         if not status:
-            return JSONResponse(
-                content={"fulfillmentText": "No order found with this ID for your account."}
-            )
+            return JSONResponse(content={"fulfillmentText": "Sorry, I could not find that order."})
 
-        friendly = _chatbot_friendly_track_status(status)
-        text = f"Order #{oid} is currently: {friendly}"
-        return JSONResponse(content={"fulfillmentText": text})
-
+        return JSONResponse(
+            content={"fulfillmentText": _chatbot_track_status_text(oid, status)}
+        )
     except Exception:
         logger.exception("[CHATBOT] track_order")
         return JSONResponse(
@@ -3498,28 +2849,41 @@ def track_order(parameters, session_id):
             }
         )
 
-def cancel_order_handler(parameters, session_id):
-    """
-    Only reached when Dialogflow sends order.cancel AND no food item was
-    detected in query_text (the FORCE_ROUTE guard runs before this handler).
-    Cart check lives here — NOT in the global pipeline.
-    """
+INTENT_HANDLER_MAP = {
+    "Default Welcome Intent": greeting_handler,
+    "Default Fallback Intent": fallback_handler,
+    "new.order": new_order_handler,
+    "order.add - context: ongoing-order": add_to_order,
+    "order.remove - context: ongoing-order": remove_from_order,
+    "order.complete - context: ongoing-order": complete_order,
+    "track-order - context: ongoing-tracking": track_order,
+    "track.order": track_order,
+}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
     try:
-        sid = _chatbot_session_key(session_id)
-        cart = inprogress_orders.get(sid)
-        if not cart:
-            return JSONResponse(
-                content={"fulfillmentText": "You don't have an active order to cancel."}
-            )
-        cart.clear()
-        pending_orders.pop(sid, None)
-        logger.info(f"[CHATBOT] cancel_order_handler: cart cleared for session={sid}")
-        return JSONResponse(content={"fulfillmentText": "Your order has been cancelled."})
+        payload = await request.json()
     except Exception:
-        logger.exception("[CHATBOT] cancel_order_handler")
-        return JSONResponse(content={"fulfillmentText": "Something went wrong. Please try again."})
+        return JSONResponse(
+            status_code=400,
+            content={"fulfillmentText": "Invalid webhook request"},
+        )
 
+    query_result = payload.get("queryResult", {}) or {}
+    intent = query_result.get("intent", {}).get("displayName", "")
+    parameters = query_result.get("parameters", {}) or {}
 
+    session_full = payload.get("session", "") or ""
+    session_id = session_full.split("/")[-1] if session_full else "default-session"
+    session_id = _normalize_chatbot_session_id(session_id) or "default-session"
+    _consolidate_chatbot_session_state(session_id)
+
+    handler = INTENT_HANDLER_MAP.get(intent, fallback_handler)
+    if inspect.iscoroutinefunction(handler):
+        return await handler(parameters, session_id)
+    return handler(parameters, session_id)
 
 if __name__ == "__main__":
     import uvicorn
